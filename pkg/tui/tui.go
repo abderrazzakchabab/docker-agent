@@ -254,6 +254,9 @@ type appModel struct {
 	// hideSidebar hides the sidebar and disables the ctrl+b toggle.
 	hideSidebar bool
 
+	// subAgentTabs streams each delegated sub-agent session in its own tab.
+	subAgentTabs bool
+
 	// defaultNewSessionDir, when non-empty, is the directory generic
 	// new-session actions (/new, Ctrl+T, the tab-bar and status-bar "+")
 	// spawn in instead of opening the working-directory picker. Set only
@@ -542,6 +545,10 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 
 	// Initialize status bar (pass m as help provider)
 	m.statusBar = statusbar.New(m, statusbar.WithTitle(m.appName+" "+m.appVersion))
+
+	if m.subAgentTabs && !m.leanMode {
+		sv.EnableSubAgentTabs()
+	}
 
 	// Add the initial session to the supervisor
 	sv.AddSession(ctx, initialApp, initialApp.Session(), initialWorkingDir, cleanup)
@@ -935,6 +942,9 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.SwitchTabMsg:
 		return m.handleSwitchTab(msg.SessionID)
 
+	case messages.SubAgentTabOpenedMsg:
+		return m.handleSubAgentTabOpened(msg.TabID)
+
 	case messages.CloseTabMsg:
 		return m.handleCloseTab(msg.SessionID)
 
@@ -946,7 +956,7 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.hideSidebar {
 			return m, nil
 		}
-		if m.tuiStore != nil {
+		if m.tuiStore != nil && !m.isSubAgentTab(m.supervisor.ActiveID()) {
 			persistedID := m.persistedSessionID(m.supervisor.ActiveID())
 			if err := m.tuiStore.ToggleSidebarCollapsed(m.ctx(), persistedID); err != nil {
 				slog.Warn("Failed to persist sidebar collapsed state", "error", err)
@@ -1988,7 +1998,9 @@ func (m *appModel) handleSwitchTab(sessionID string) (tea.Model, tea.Cmd) {
 	}
 
 	m.reapplyKeyboardEnhancements()
-	m.persistActiveTab(m.persistedSessionID(sessionID))
+	if runner.ParentID == "" {
+		m.persistActiveTab(m.persistedSessionID(sessionID))
+	}
 
 	// Sync editor working state and reset working spinner.
 	m.activeTab.editor.SetWorking(m.activeTab.chatPage.IsWorking())
@@ -2038,9 +2050,11 @@ func (m *appModel) handleReorderTab(msg messages.ReorderTabMsg) {
 
 	if m.tuiStore != nil {
 		tabs, _ := m.supervisor.GetTabs()
-		ids := make([]string, len(tabs))
-		for i, tab := range tabs {
-			ids[i] = m.persistedSessionID(tab.SessionID)
+		ids := make([]string, 0, len(tabs))
+		for _, tab := range tabs {
+			if !m.isSubAgentTab(tab.SessionID) {
+				ids = append(ids, m.persistedSessionID(tab.SessionID))
+			}
 		}
 		if err := m.tuiStore.ReorderTab(m.ctx(), ids); err != nil {
 			slog.Warn("Failed to persist tab reorder", "error", err)
@@ -2050,6 +2064,9 @@ func (m *appModel) handleReorderTab(msg messages.ReorderTabMsg) {
 
 // handleCloseTab closes a session tab.
 func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
+	// Closing a sub-agent tab only hides the view; its sub-session keeps running.
+	subAgentCmd := m.closeSubAgentTabs(sessionID)
+	subAgentTab := m.isSubAgentTab(sessionID)
 	wasActive := sessionID == m.supervisor.ActiveID()
 	if wasActive {
 		m.cancelSidebarPlanEdit()
@@ -2080,9 +2097,9 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	}
 	delete(m.tabs, sessionID)
 
-	var cmds []tea.Cmd
+	cmds := []tea.Cmd{subAgentCmd}
 	// Remove from persistent store using the persisted session-store ID.
-	if m.tuiStore != nil {
+	if m.tuiStore != nil && !subAgentTab {
 		ctx, cancel := context.WithTimeout(m.ctx(), 1*time.Second)
 		defer cancel()
 		if err := m.tuiStore.RemoveTab(ctx, persistedID); err != nil {
@@ -2102,12 +2119,14 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 		if workingDir == "" {
 			workingDir = "."
 		}
-		return m.handleSpawnSession(workingDir)
+		model, cmd := m.handleSpawnSession(workingDir)
+		return model, tea.Batch(subAgentCmd, cmd)
 	}
 
 	// If the closed tab was active, switch to the next one
 	if wasActive && nextActiveID != "" {
-		return m.handleSwitchTab(nextActiveID)
+		model, cmd := m.handleSwitchTab(nextActiveID)
+		return model, tea.Batch(subAgentCmd, cmd)
 	}
 
 	return m, tea.Batch(cmds...)

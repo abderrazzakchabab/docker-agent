@@ -1162,3 +1162,52 @@ func SubSessionCompleted(parentSessionID string, subSession any, agentName strin
 		AgentContext:    newAgentContext(agentName),
 	}
 }
+
+// SubSessionStartedEvent announces a delegated sub-session (transfer_task or
+// run_background_agent) before its stream starts, so a UI can give it its own
+// view. Emitted only after [LocalRuntime.EnableSubSessionEvents].
+type SubSessionStartedEvent struct {
+	AgentContext
+
+	Type            string `json:"type"`
+	ParentSessionID string `json:"parent_session_id"`
+	SessionID       string `json:"session_id"`
+	Task            string `json:"task,omitempty"`
+	Background      bool   `json:"background,omitempty"`
+}
+
+func SubSessionStarted(parentSessionID, sessionID, agentName, task string, background bool) Event {
+	return &SubSessionStartedEvent{
+		Type:            "sub_session_started",
+		ParentSessionID: parentSessionID,
+		SessionID:       sessionID,
+		Task:            task,
+		Background:      background,
+		AgentContext:    newAgentContext(agentName),
+	}
+}
+
+func (e *SubSessionStartedEvent) GetSessionID() string { return e.SessionID }
+
+// BackgroundSubSessionEvent carries one event of a background sub-session's
+// stream, which otherwise never leaves the runtime. The wrapper attributes
+// events that carry no session ID of their own (tool calls, confirmations).
+// Emitted only after [LocalRuntime.EnableSubSessionEvents].
+type BackgroundSubSessionEvent struct {
+	AgentContext
+
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Event     Event  `json:"event"`
+}
+
+func BackgroundSubSession(sessionID, agentName string, event Event) Event {
+	return &BackgroundSubSessionEvent{
+		Type:         "background_sub_session",
+		SessionID:    sessionID,
+		Event:        event,
+		AgentContext: newAgentContext(agentName),
+	}
+}
+
+func (e *BackgroundSubSessionEvent) GetSessionID() string { return e.SessionID }

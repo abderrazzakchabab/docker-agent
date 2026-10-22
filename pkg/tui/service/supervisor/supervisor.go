@@ -24,8 +24,11 @@ type SessionRunner struct {
 	WorkingDir string
 	State      *tabstate.State
 	Scope      *messages.RouteScope
-	cancel     context.CancelFunc
-	cleanup    func()
+	// ParentID is set on sub-agent tabs: read-only views of a sub-session
+	// running in the parent tab's runtime. They own no context or cleanup.
+	ParentID string
+	cancel   context.CancelFunc
+	cleanup  func()
 }
 
 // SessionSpawner is a function that creates new sessions.
@@ -40,6 +43,8 @@ type Supervisor struct {
 	activeID string
 	spawner  SessionSpawner
 	program  *tea.Program
+	// subAgentTabs opens a tab per delegated sub-session; see EnableSubAgentTabs.
+	subAgentTabs bool
 
 	// programReady is closed when SetProgram is called. Subscription goroutines
 	// wait on this before consuming events so that startup events (welcome message,
@@ -85,6 +90,9 @@ func (s *Supervisor) AddSession(ctx context.Context, a *app.App, sess *session.S
 	sessionCtx, cancel := context.WithCancel(ctx)
 	runner.cancel = cancel
 	if a != nil {
+		if s.subAgentTabs {
+			a.EnableSubSessionEvents()
+		}
 		a.Start(sessionCtx)
 	}
 
@@ -130,6 +138,7 @@ func (s *Supervisor) subscribeWithRouting(ctx context.Context, a *app.App, sessi
 		return
 	}
 
+	router := newSubAgentRouter()
 	send := func(msg tea.Msg) {
 		s.mu.RLock()
 		p, runner := s.program, s.runners[sessionID]
@@ -137,8 +146,12 @@ func (s *Supervisor) subscribeWithRouting(ctx context.Context, a *app.App, sessi
 			s.mu.RUnlock()
 			return
 		}
-		scope := runner.Scope
+		scope, subAgentTabs := runner.Scope, s.subAgentTabs
 		s.mu.RUnlock()
+		if subAgentTabs {
+			s.routeSubAgentMsg(p.Send, router, sessionID, runner, scope, msg)
+			return
+		}
 		p.Send(messages.RoutedMsg{SessionID: sessionID, Scope: scope, Inner: msg})
 	}
 
@@ -274,6 +287,9 @@ func (s *Supervisor) ReplaceRunnerApp(ctx context.Context, sessionID string, new
 	// Create a new cancellable context for the replacement.
 	sessionCtx, cancel := context.WithCancel(ctx)
 	runner.cancel = cancel
+	if s.subAgentTabs {
+		newApp.EnableSubSessionEvents()
+	}
 	newApp.Start(sessionCtx)
 
 	s.notifyTabsUpdated()

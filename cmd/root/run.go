@@ -112,6 +112,7 @@ type runExecFlags struct {
 	leanChanged     bool
 	appName         string
 	sidebar         bool
+	subAgentTabs    bool
 	listenAddr      string
 	// sessionWorkingDirRoot confines the working_dir of sessions created
 	// through the --listen control plane; empty means unrestricted (see
@@ -207,6 +208,7 @@ func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
 	cmd.PersistentFlags().StringVar(&flags.appName, "app-name", "", "Application name shown in the TUI in place of \"docker agent\"")
 	cmd.PersistentFlags().StringSliceVar(&flags.disabledCommands, "disable-commands", nil, "Comma-separated list of slash commands to hide and disable in the TUI (e.g. /cost,/eval,/model)")
 	cmd.PersistentFlags().BoolVar(&flags.sidebar, "sidebar", true, "Show the sidebar in the TUI (set --sidebar=false to hide it)")
+	cmd.PersistentFlags().BoolVar(&flags.subAgentTabs, "sub-agent-tabs", false, "Open each sub-agent run (transfer_task, run_background_agent) in its own TUI tab")
 	cmd.PersistentFlags().StringVar(&flags.theme, "theme", "", "Preselect a TUI theme by name, or \"auto\" to match the terminal's light/dark background (overrides the theme from user config; ignored outside the interactive TUI)")
 	_ = cmd.RegisterFlagCompletionFunc("theme", completeTheme)
 	cmd.PersistentFlags().BoolVar(&flags.sandbox, "sandbox", false, "Run the agent inside a Docker sandbox (requires Docker Desktop with sandbox support)")
@@ -1087,6 +1089,9 @@ func (f *runExecFlags) tuiOpts(args []string) []tui.Option {
 	}
 	if !f.sidebar {
 		opts = append(opts, tui.WithHideSidebar())
+	}
+	if f.subAgentTabs {
+		opts = append(opts, tui.WithSubAgentTabs())
 	}
 	switch {
 	case f.tour:

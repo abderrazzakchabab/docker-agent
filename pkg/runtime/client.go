@@ -116,6 +116,8 @@ func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
 			"message_added":          func() Event { return &MessageAddedEvent{} },
 			"model_fallback":         func() Event { return &ModelFallbackEvent{} },
 			"sub_session_completed":  func() Event { return &SubSessionCompletedEvent{} },
+			"sub_session_started":    func() Event { return &SubSessionStartedEvent{} },
+			"background_sub_session": func() Event { return &BackgroundSubSessionEvent{} },
 		},
 	}
 

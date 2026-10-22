@@ -1315,6 +1315,33 @@ func (a *App) Session() *session.Session {
 	return a.session
 }
 
+// subSessionEventSource is an optional runtime capability: announcing
+// delegated sub-sessions and forwarding background sub-session streams.
+type subSessionEventSource interface {
+	EnableSubSessionEvents()
+}
+
+// EnableSubSessionEvents opts the runtime into sub-session announcements
+// (see [runtime.LocalRuntime.EnableSubSessionEvents]). No-op for runtimes
+// without the capability, such as remote ones.
+func (a *App) EnableSubSessionEvents() {
+	if src, ok := a.runtime.(subSessionEventSource); ok {
+		src.EnableSubSessionEvents()
+	}
+}
+
+// NewSubSessionView returns a read-only App sharing a's runtime, bound to an
+// empty placeholder for the sub-session sessionID. Dialog answers (tool
+// confirmations, elicitations) resume the shared runtime. The view is never
+// started, so it registers no runtime handlers and emits no events.
+func (a *App) NewSubSessionView(sessionID, title string) *App {
+	opts := []session.Opt{session.WithID(sessionID), session.WithTitle(title)}
+	if a.session != nil {
+		opts = append(opts, session.WithWorkingDir(a.session.WorkingDir))
+	}
+	return New(a.ctx(), a.runtime, session.New(opts...), WithReadOnly())
+}
+
 // contextBreakdownProvider is an optional runtime capability: computing the
 // estimated context-window composition for a session. Only the local runtime
 // (which holds the agent and its tools) implements it; remote runtimes

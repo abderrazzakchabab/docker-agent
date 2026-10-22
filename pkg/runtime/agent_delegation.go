@@ -387,6 +387,10 @@ func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Sessio
 	if req.directNativeTransfer {
 		idleRetryPolicy = idleStreamRetryPolicy{enabled: true, parentSessionID: parent.ID}
 	}
+	// directNativeTransfer marks transfer_task; skills keep rendering inline.
+	if req.directNativeTransfer && r.subSessionEvents.Load() {
+		evts.Emit(SubSessionStarted(parent.ID, s.ID, req.AgentName, req.Task, false))
+	}
 	childEvents := r.runStream(ctx, s, idleRetryPolicy)
 	var subSessionErr error
 	for event := range childEvents {
@@ -462,9 +466,25 @@ func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Sessio
 		r.executeSubagentStopHooks(ctx, parent, s, callerAgent, cfg.AgentName, s.GetLastAssistantMessageContent())
 	}()
 
+	// Elicitations already reach the UI through the OnElicitationRequest sink
+	// and token usage is surfaced unwrapped below; forwarding either again
+	// would duplicate them.
+	forward := func(Event) {}
+	if r.subSessionEvents.Load() {
+		r.emitBackgroundEvent(SubSessionStarted(parent.ID, s.ID, cfg.AgentName, cfg.Task, true))
+		forward = func(event Event) {
+			switch event.(type) {
+			case *ElicitationRequestEvent, *TokenUsageEvent:
+				return
+			}
+			r.emitBackgroundEvent(BackgroundSubSession(s.ID, cfg.AgentName, event))
+		}
+	}
+
 	var errMsg string
 	events := r.RunStream(ctx, s)
 	for event := range events {
+		forward(event)
 		if ctx.Err() != nil {
 			break
 		}
@@ -495,7 +515,8 @@ func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Sessio
 	}
 	// Drain remaining events so the RunStream goroutine can complete and
 	// close the channel without blocking on a full buffer.
-	for range events {
+	for event := range events {
+		forward(event)
 	}
 
 	// The loop above stops forwarding on ctx cancellation / first ErrorEvent,

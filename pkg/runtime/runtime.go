@@ -375,6 +375,10 @@ type LocalRuntime struct {
 	backgroundEventMu sync.RWMutex
 	onBackgroundEvent func(Event)
 
+	// subSessionEvents opts into SubSessionStarted announcements and
+	// background sub-session stream forwarding; see EnableSubSessionEvents.
+	subSessionEvents atomic.Bool
+
 	bgAgents *agenttool.Handler
 
 	// dmrModelLister lists the models pulled locally in Docker Model Runner,
@@ -1620,6 +1624,15 @@ func (r *LocalRuntime) OnBackgroundEvent(handler func(Event)) {
 	r.backgroundEventMu.Lock()
 	defer r.backgroundEventMu.Unlock()
 	r.onBackgroundEvent = handler
+}
+
+// EnableSubSessionEvents makes the runtime announce delegated sub-sessions
+// (transfer_task, run_background_agent) with a SubSessionStartedEvent and
+// forward each background sub-session event, wrapped in a
+// BackgroundSubSessionEvent, through the OnBackgroundEvent handler. Off by
+// default so embedders that don't render sub-sessions see no new events.
+func (r *LocalRuntime) EnableSubSessionEvents() {
+	r.subSessionEvents.Store(true)
 }
 
 // emitBackgroundEvent forwards an event from detached background work to the
