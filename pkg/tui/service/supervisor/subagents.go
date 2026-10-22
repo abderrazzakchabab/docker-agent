@@ -89,10 +89,40 @@ func (r *subAgentRouter) route(msg tea.Msg, rootID string) subAgentRoute {
 			return subAgentRoute{target: id, msg: msg}
 		}
 	}
-	if n := len(r.stack); n > 0 {
+	if n := len(r.stack); n > 0 && inStream(msg) {
 		return subAgentRoute{target: r.stack[n-1], msg: msg}
 	}
 	return subAgentRoute{msg: msg}
+}
+
+// inStream reports whether an event without a known session belongs to the
+// stream it interrupts: tagged events of nested non-delegation sessions (skills)
+// and the untagged types a run loop emits. App-level notices that can arrive
+// concurrently (toolset changes, MCP init, RAG indexing, plans, shell output)
+// stay with the subscribing tab.
+func inStream(msg tea.Msg) bool {
+	if scoped, ok := msg.(runtime.SessionScoped); ok && scoped.GetSessionID() != "" {
+		return true
+	}
+	switch msg.(type) {
+	case *runtime.PartialToolCallEvent, *runtime.ToolCallEvent, *runtime.ToolCallConfirmationEvent,
+		*runtime.ToolCallOutputEvent, *runtime.ToolCallResponseEvent, *runtime.MaxIterationsReachedEvent,
+		*runtime.WarningEvent, *runtime.ModelFallbackEvent, *runtime.AuthorizationEvent,
+		*runtime.HookBlockedEvent, *runtime.AgentInfoEvent, *runtime.AgentSwitchingEvent:
+		return true
+	default:
+		return false
+	}
+}
+
+// isAttention reports prompts the runtime blocks on until the user answers.
+func isAttention(msg tea.Msg) bool {
+	switch msg.(type) {
+	case *runtime.ToolCallConfirmationEvent, *runtime.MaxIterationsReachedEvent, *runtime.ElicitationRequestEvent:
+		return true
+	default:
+		return false
+	}
 }
 
 // closeStream pops id along with any children left open above it.
@@ -135,33 +165,39 @@ func (s *Supervisor) EnableSubAgentTabs() {
 // sub-agent tab first when the runtime announces a new sub-session.
 func (s *Supervisor) routeSubAgentMsg(send func(tea.Msg), router *subAgentRouter, parentID string, parent *SessionRunner, scope *messages.RouteScope, msg tea.Msg) {
 	route := router.route(msg, parent.State.SessionID())
-	if route.open != nil && s.addSubAgentRunner(parentID, parent, route.open) {
+	if route.open != nil && s.AddSubAgentTab(parentID, route.open) {
 		send(messages.SubAgentTabOpenedMsg{TabID: route.open.SessionID})
 	}
 	if route.msg == nil {
 		return
 	}
-	if route.target == "" {
-		send(messages.RoutedMsg{SessionID: parentID, Scope: scope, Inner: route.msg})
-		return
+	if route.target != "" {
+		s.mu.RLock()
+		child := s.runners[route.target]
+		s.mu.RUnlock()
+		if child != nil {
+			send(messages.RoutedMsg{SessionID: route.target, Scope: child.Scope, Inner: route.msg})
+			return
+		}
+		// A closed sub-agent tab only hid the view: its session keeps running
+		// and may still block on a prompt, which then surfaces in the parent
+		// tab exactly as it would without sub-agent tabs.
+		if !isAttention(route.msg) {
+			return
+		}
 	}
-	s.mu.RLock()
-	child := s.runners[route.target]
-	s.mu.RUnlock()
-	// A closed sub-agent tab only hid the view: its session keeps running.
-	if child == nil {
-		return
-	}
-	send(messages.RoutedMsg{SessionID: route.target, Scope: child.Scope, Inner: route.msg})
+	send(messages.RoutedMsg{SessionID: parentID, Scope: scope, Inner: route.msg})
 }
 
-// addSubAgentRunner adds a tab viewing sub-session ev after parentID's tab
-// and its earlier sub-agent tabs, without activating it.
-func (s *Supervisor) addSubAgentRunner(parentID string, parent *SessionRunner, ev *runtime.SubSessionStartedEvent) bool {
+// AddSubAgentTab adds a tab viewing sub-session ev after parentID's tab and
+// its earlier sub-agent tabs, without activating it. The tab shares the
+// parent's runtime through a read-only view App.
+func (s *Supervisor) AddSubAgentTab(parentID string, ev *runtime.SubSessionStartedEvent) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if ev.SessionID == "" || s.runners[ev.SessionID] != nil || s.runners[parentID] != parent {
+	parent := s.runners[parentID]
+	if ev.SessionID == "" || s.runners[ev.SessionID] != nil || parent == nil || parent.ParentID != "" {
 		return false
 	}
 	title := subAgentTabTitle(ev.AgentName, ev.Task)

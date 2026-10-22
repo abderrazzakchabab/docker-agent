@@ -880,6 +880,9 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	if cmd := m.rejectInSubAgentTab(msg); cmd != nil {
+		return m, cmd
+	}
 
 	switch msg := msg.(type) {
 	// --- Routing & Animation ---
@@ -2066,7 +2069,11 @@ func (m *appModel) handleReorderTab(msg messages.ReorderTabMsg) {
 func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	// Closing a sub-agent tab only hides the view; its sub-session keeps running.
 	subAgentCmd := m.closeSubAgentTabs(sessionID)
-	subAgentTab := m.isSubAgentTab(sessionID)
+	var parentID string
+	if runner := m.supervisor.GetRunner(sessionID); runner != nil {
+		parentID = runner.ParentID
+	}
+	subAgentTab := parentID != ""
 	wasActive := sessionID == m.supervisor.ActiveID()
 	if wasActive {
 		m.cancelSidebarPlanEdit()
@@ -2081,6 +2088,9 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	// Compute persisted session-store ID *before* closing (runner goes away).
 	persistedID := m.persistedSessionID(sessionID)
 
+	if subAgentTab {
+		subAgentCmd = tea.Batch(subAgentCmd, m.handOffSubAgentAttention(sessionID, parentID))
+	}
 	if wasActive {
 		m.retireAttention(m.activeTab)
 	}
@@ -2129,6 +2139,10 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 		return model, tea.Batch(subAgentCmd, cmd)
 	}
 
+	if subAgentTab {
+		// Prompts handed to a visible parent open now rather than on the next event.
+		cmds = append(cmds, m.replayPendingEvent(parentID))
+	}
 	return m, tea.Batch(cmds...)
 }
 

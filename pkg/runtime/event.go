@@ -1192,7 +1192,8 @@ func (e *SubSessionStartedEvent) GetSessionID() string { return e.SessionID }
 // BackgroundSubSessionEvent carries one event of a background sub-session's
 // stream, which otherwise never leaves the runtime. The wrapper attributes
 // events that carry no session ID of their own (tool calls, confirmations).
-// Emitted only after [LocalRuntime.EnableSubSessionEvents].
+// Emitted only after [LocalRuntime.EnableSubSessionEvents]. Local-only: the
+// remote client cannot decode the interface-typed Event from JSON.
 type BackgroundSubSessionEvent struct {
 	AgentContext
 

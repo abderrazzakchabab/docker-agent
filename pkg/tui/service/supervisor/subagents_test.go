@@ -111,12 +111,24 @@ func TestSubAgentRouter_BackgroundAgentUnwrapsIntoItsTab(t *testing.T) {
 	assert.Same(t, inner, r.route(runtime.BackgroundSubSession("bg", "scout", inner), "root").msg, "wrapped events are delivered unwrapped")
 }
 
-func TestSubAgentRouter_NonRuntimeMessagesStayWithParent(t *testing.T) {
+func TestSubAgentRouter_AppNoticesStayWithParent(t *testing.T) {
 	t.Parallel()
 
 	runRouteSteps(t, newSubAgentRouter(), []routeStep{
 		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: "ship", drop: true},
+		// Concurrent app-level notices are not part of the child's stream.
 		{msg: messages.StreamCancelledMsg{}},
+		{msg: &runtime.ToolsetInfoEvent{}},
+		{msg: &runtime.MCPInitStartedEvent{}},
+		{msg: &runtime.RAGIndexingStartedEvent{}},
+		{msg: &runtime.PlanChangedEvent{}},
+		{msg: &runtime.ShellOutputEvent{}},
+		{msg: &runtime.TeamInfoEvent{}},
+		// Untagged events of the child's own run loop follow it.
+		{msg: &runtime.AgentInfoEvent{}, target: "ship"},
+		{msg: &runtime.WarningEvent{}, target: "ship"},
+		{msg: &runtime.MaxIterationsReachedEvent{}, target: "ship"},
+		{msg: &runtime.ToolCallOutputEvent{}, target: "ship"},
 	})
 }
 
@@ -166,25 +178,62 @@ func TestRouteSubAgentMsg_OpensTabNextToParentAndRoutes(t *testing.T) {
 	assert.False(t, tabs[1].IsActive)
 }
 
-func TestRouteSubAgentMsg_ClosedTabHidesWithoutFallingBackToParent(t *testing.T) {
+func TestRouteSubAgentMsg_ClosedTabStillSurfacesPrompts(t *testing.T) {
 	t.Parallel()
 
 	s := newTestSupervisor([]string{"A"}, "A")
 	parent := s.runners["A"]
+	scope := &messages.RouteScope{}
 	router := newSubAgentRouter()
 	var sent []tea.Msg
 	send := func(msg tea.Msg) { sent = append(sent, msg) }
+	route := func(msg tea.Msg) { s.routeSubAgentMsg(send, router, "A", parent, scope, msg) }
 
-	s.routeSubAgentMsg(send, router, "A", parent, nil, runtime.SubSessionStarted("A", "ship", "ship", "", false))
+	route(runtime.SubSessionStarted("A", "ship", "ship", "", false))
+	route(runtime.SubSessionStarted("A", "bg", "scout", "", true))
+	route(runtime.StreamStarted("ship", "ship"))
 	assert.Equal(t, "A", s.CloseSession("ship"))
+	assert.Equal(t, "A", s.CloseSession("bg"))
 	sent = nil
 
-	s.routeSubAgentMsg(send, router, "A", parent, nil, &runtime.ToolCallEvent{})
-	assert.Empty(t, sent, "events of a hidden sub-agent must not leak into the parent tab")
+	// Display-only events of a hidden sub-agent are dropped, not leaked into the parent.
+	route(&runtime.ToolCallEvent{})
+	route(&runtime.AgentChoiceEvent{SessionID: "ship"})
+	route(runtime.BackgroundSubSession("bg", "scout", &runtime.ToolCallEvent{}))
+	assert.Empty(t, sent)
 
-	s.routeSubAgentMsg(send, router, "A", parent, nil, runtime.StreamStopped("ship", "ship", "normal"))
-	s.routeSubAgentMsg(send, router, "A", parent, nil, &runtime.ToolCallEvent{})
-	require.Len(t, sent, 1)
+	// The runtime blocks on these until answered: they must still reach the user.
+	confirm := &runtime.ToolCallConfirmationEvent{}
+	maxIter := &runtime.MaxIterationsReachedEvent{}
+	fgElicit := &runtime.ElicitationRequestEvent{SessionID: "ship"}
+	bgElicit := &runtime.ElicitationRequestEvent{SessionID: "bg"}
+	for _, prompt := range []tea.Msg{confirm, maxIter, fgElicit, bgElicit} {
+		route(prompt)
+	}
+	require.Len(t, sent, 4)
+	for i, prompt := range []tea.Msg{confirm, maxIter, fgElicit, bgElicit} {
+		routed, ok := sent[i].(messages.RoutedMsg)
+		require.True(t, ok)
+		assert.Equal(t, "A", routed.SessionID, "prompt %T goes to the parent tab", prompt)
+		assert.Same(t, scope, routed.Scope)
+		assert.Same(t, prompt, routed.Inner)
+	}
+
+	sent = nil
+	route(runtime.StreamStopped("ship", "ship", "normal"))
+	route(&runtime.ToolCallEvent{})
+	require.Len(t, sent, 1, "the parent's own events resume once the child stops")
 	assert.Equal(t, "A", sent[0].(messages.RoutedMsg).SessionID)
-	assert.Equal(t, []string{"A"}, s.order)
+	assert.Equal(t, []string{"A"}, s.order, "closed sub-agent tabs are not reopened")
+}
+
+func TestAddSubAgentTab_RejectsUnknownOrNestedParents(t *testing.T) {
+	t.Parallel()
+
+	s := newTestSupervisor([]string{"A"}, "A")
+	assert.False(t, s.AddSubAgentTab("missing", &runtime.SubSessionStartedEvent{SessionID: "x"}))
+	assert.False(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{}))
+	require.True(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{SessionID: "ship"}))
+	assert.False(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{SessionID: "ship"}), "no duplicates")
+	assert.False(t, s.AddSubAgentTab("ship", &runtime.SubSessionStartedEvent{SessionID: "scout"}), "sub-agent tabs group under the subscribing tab")
 }
