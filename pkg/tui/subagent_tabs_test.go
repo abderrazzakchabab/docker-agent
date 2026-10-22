@@ -3,6 +3,7 @@ package tui
 import (
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -158,4 +159,28 @@ func TestSubAgentTabsAreNeverPersisted(t *testing.T) {
 	assert.Equal(t, persistedID, saved[0].SessionID)
 	assert.False(t, saved[0].SidebarCollapsed)
 	assert.Equal(t, persistedID, active)
+}
+
+// The subscription routed a prompt to the sub-agent tab just before the tab
+// closed: delivery must redirect it, since the sub-session waits on it.
+func TestInFlightSubAgentPromptAfterCloseReachesParent(t *testing.T) {
+	t.Parallel()
+	m, parentID := newSubAgentTabModel(t)
+	confirm := subAgentConfirmation()
+	inflight := queuedRuntimeDelivery(m, subAgentTabID, confirm)
+
+	_, _ = m.handleCloseTab(subAgentTabID)
+	_, _ = m.Update(inflight)
+
+	require.Equal(t, parentID, m.supervisor.ActiveID())
+	opened := takeAttention(m)
+	require.Len(t, opened, 1, "the in-flight prompt must reach the parent tab")
+	assert.Same(t, confirm, opened[0].OriginatingEvent)
+
+	_, _ = m.Update(queuedRuntimeDeliveryTo(subAgentTabID, &runtime.AgentChoiceEvent{SessionID: subAgentTabID}))
+	assert.False(t, m.dialogMgr.Open(), "display events of a closed sub-agent tab are dropped")
+}
+
+func queuedRuntimeDeliveryTo(id string, event tea.Msg) messages.RoutedMsg {
+	return messages.RoutedMsg{SessionID: id, Scope: &messages.RouteScope{}, Inner: event}
 }

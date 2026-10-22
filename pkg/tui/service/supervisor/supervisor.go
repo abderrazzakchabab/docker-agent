@@ -45,6 +45,9 @@ type Supervisor struct {
 	program  *tea.Program
 	// subAgentTabs opens a tab per delegated sub-session; see EnableSubAgentTabs.
 	subAgentTabs bool
+	// closedSubAgents maps closed sub-agent tabs to their parent tab, so
+	// prompts already in flight to a closed tab can still be redirected.
+	closedSubAgents map[string]string
 
 	// programReady is closed when SetProgram is called. Subscription goroutines
 	// wait on this before consuming events so that startup events (welcome message,
@@ -149,7 +152,7 @@ func (s *Supervisor) subscribeWithRouting(ctx context.Context, a *app.App, sessi
 		scope, subAgentTabs := runner.Scope, s.subAgentTabs
 		s.mu.RUnlock()
 		if subAgentTabs {
-			s.routeSubAgentMsg(p.Send, router, sessionID, runner, scope, msg)
+			s.routeSubAgentMsg(p.Send, router, sessionID, scope, msg)
 			return
 		}
 		p.Send(messages.RoutedMsg{SessionID: sessionID, Scope: scope, Inner: msg})
@@ -335,6 +338,12 @@ func (s *Supervisor) CloseSession(sessionID string) string {
 
 	// Remove from maps
 	delete(s.runners, sessionID)
+	if runner.ParentID != "" {
+		if s.closedSubAgents == nil {
+			s.closedSubAgents = make(map[string]string)
+		}
+		s.closedSubAgents[sessionID] = runner.ParentID
+	}
 
 	// Remove from order slice, remembering where it was.
 	closedIdx := 0

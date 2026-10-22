@@ -387,14 +387,25 @@ func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Sessio
 	if req.directNativeTransfer {
 		idleRetryPolicy = idleStreamRetryPolicy{enabled: true, parentSessionID: parent.ID}
 	}
+	forward := evts.Emit
 	// directNativeTransfer marks transfer_task; skills keep rendering inline.
 	if req.directNativeTransfer && r.subSessionEvents.Load() {
 		evts.Emit(SubSessionStarted(parent.ID, s.ID, req.AgentName, req.Task, false))
+		forward = func(event Event) {
+			// Tagged events keep their pipeline (persistence filter, mirrored
+			// elicitation dedupe, usage accounting); untagged ones would be
+			// indistinguishable from a concurrent sibling's.
+			if scoped, ok := event.(SessionScoped); ok && scoped.GetSessionID() != "" {
+				evts.Emit(event)
+				return
+			}
+			evts.Emit(SubSessionStream(s.ID, req.AgentName, false, event))
+		}
 	}
 	childEvents := r.runStream(ctx, s, idleRetryPolicy)
 	var subSessionErr error
 	for event := range childEvents {
-		evts.Emit(event)
+		forward(event)
 		if budgetEvent, ok := event.(*BudgetExceededEvent); ok &&
 			req.directNativeTransfer && budgetEvent.SessionID == s.ID && subSessionErr == nil {
 			subSessionErr = errors.New(budgetEvent.Message)
@@ -477,7 +488,7 @@ func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Sessio
 			case *ElicitationRequestEvent, *TokenUsageEvent:
 				return
 			}
-			r.emitBackgroundEvent(BackgroundSubSession(s.ID, cfg.AgentName, event))
+			r.emitBackgroundEvent(SubSessionStream(s.ID, cfg.AgentName, true, event))
 		}
 	}
 

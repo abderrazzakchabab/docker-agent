@@ -9,26 +9,26 @@ import (
 
 	"github.com/docker/docker-agent/pkg/runtime"
 	"github.com/docker/docker-agent/pkg/session"
+	"github.com/docker/docker-agent/pkg/tools"
 	"github.com/docker/docker-agent/pkg/tui/messages"
 )
 
 type routeStep struct {
 	msg    tea.Msg
-	target string // "" = parent tab
-	open   string // sub-agent tab expected to open
-	drop   bool   // nothing delivered
+	target string   // "" = parent tab
+	open   []string // sub-agent tabs expected to open
+	drop   bool     // nothing delivered
 }
 
 func runRouteSteps(t *testing.T, r *subAgentRouter, steps []routeStep) {
 	t.Helper()
 	for i, step := range steps {
-		got := r.route(step.msg, "root")
-		if step.open != "" {
-			require.NotNil(t, got.open, "step %d (%T): expected tab %q to open", i, step.msg, step.open)
-			assert.Equal(t, step.open, got.open.SessionID, "step %d", i)
-		} else {
-			assert.Nil(t, got.open, "step %d (%T): unexpected tab open", i, step.msg)
+		got := r.route(step.msg)
+		var opened []string
+		for _, ev := range got.open {
+			opened = append(opened, ev.SessionID)
 		}
+		assert.Equal(t, step.open, opened, "step %d (%T): opened tabs", i, step.msg)
 		if step.drop {
 			assert.Nil(t, got.msg, "step %d (%T): expected no delivery", i, step.msg)
 			continue
@@ -38,20 +38,30 @@ func runRouteSteps(t *testing.T, r *subAgentRouter, steps []routeStep) {
 	}
 }
 
+func wrap(id string, ev runtime.Event) runtime.Event {
+	return runtime.SubSessionStream(id, id, false, ev)
+}
+
+func confirmation(agent string) *runtime.ToolCallConfirmationEvent {
+	return runtime.ToolCallConfirmation(tools.ToolCall{ID: agent}, tools.Tool{Name: "shell"}, agent, nil).(*runtime.ToolCallConfirmationEvent)
+}
+
 func TestSubAgentRouter_TransferTaskStreamsToChildTab(t *testing.T) {
 	t.Parallel()
 
-	confirm := &runtime.ToolCallConfirmationEvent{}
 	runRouteSteps(t, newSubAgentRouter(), []routeStep{
 		{msg: runtime.StreamStarted("root", "firstmate")},
 		{msg: &runtime.ToolCallEvent{}},
-		{msg: runtime.SubSessionStarted("root", "ship", "ship", "fix the bug", false), open: "ship", drop: true},
+		{msg: runtime.SubSessionStarted("root", "ship", "ship", "fix the bug", false), open: []string{"ship"}, drop: true},
 		{msg: runtime.StreamStarted("ship", "ship"), target: "ship"},
 		{msg: &runtime.AgentChoiceEvent{SessionID: "ship"}, target: "ship"},
-		{msg: confirm, target: "ship"},
-		{msg: &runtime.ToolCallResponseEvent{}, target: "ship"},
+		{msg: wrap("ship", confirmation("ship")), target: "ship"},
+		{msg: wrap("ship", &runtime.ToolCallResponseEvent{}), target: "ship"},
 		{msg: &runtime.TokenUsageEvent{SessionID: "ship"}},
 		{msg: &runtime.ElicitationRequestEvent{SessionID: "ship"}, target: "ship"},
+		// A skill run by the child streams inline in the child's tab.
+		{msg: runtime.StreamStarted("skill", "ship")},
+		{msg: wrap("ship", runtime.StreamStarted("skill", "ship")), target: "ship"},
 		{msg: runtime.StreamStopped("ship", "ship", "normal"), target: "ship"},
 		{msg: runtime.SubSessionCompleted("root", session.New(session.WithID("ship")), "firstmate")},
 		{msg: &runtime.ToolCallResponseEvent{}},
@@ -59,76 +69,71 @@ func TestSubAgentRouter_TransferTaskStreamsToChildTab(t *testing.T) {
 	})
 }
 
-func TestSubAgentRouter_NestedTransfersUseInnermostTab(t *testing.T) {
+// transfer_task calls of one model turn run concurrently: attribution must
+// come from the event, never from arrival order.
+func TestSubAgentRouter_ConcurrentTransferTasksStayApart(t *testing.T) {
 	t.Parallel()
 
-	runRouteSteps(t, newSubAgentRouter(), []routeStep{
-		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: "ship", drop: true},
-		{msg: runtime.StreamStarted("ship", "ship"), target: "ship"},
-		{msg: runtime.SubSessionStarted("ship", "scout", "scout", "", false), open: "scout", drop: true},
-		{msg: runtime.StreamStarted("scout", "scout"), target: "scout"},
-		{msg: &runtime.ToolCallEvent{}, target: "scout"},
-		{msg: runtime.StreamStopped("scout", "scout", "normal"), target: "scout"},
-		{msg: &runtime.ToolCallResponseEvent{}, target: "ship"},
-		// A skill sub-session is not a delegation: it renders inline in its owner's tab.
-		{msg: runtime.StreamStarted("skill", "ship"), target: "ship"},
-		{msg: runtime.StreamStopped("skill", "ship", "normal"), target: "ship"},
-		{msg: runtime.StreamStopped("ship", "ship", "normal"), target: "ship"},
-		{msg: &runtime.ToolCallEvent{}},
+	confirmA, confirmB := confirmation("a"), confirmation("b")
+	r := newSubAgentRouter()
+	runRouteSteps(t, r, []routeStep{
+		{msg: runtime.SubSessionStarted("root", "A", "a", "", false), open: []string{"A"}, drop: true},
+		{msg: runtime.SubSessionStarted("root", "B", "b", "", false), open: []string{"B"}, drop: true},
+		{msg: runtime.StreamStarted("A", "a"), target: "A"},
+		{msg: runtime.StreamStarted("B", "b"), target: "B"},
+		{msg: wrap("B", &runtime.ToolCallEvent{}), target: "B"},
+		{msg: wrap("A", &runtime.ToolCallEvent{}), target: "A"},
+		{msg: wrap("A", confirmA), target: "A"},
+		{msg: runtime.StreamStopped("A", "a", "normal"), target: "A"},
+		{msg: wrap("B", confirmB), target: "B"},
+		{msg: wrap("B", &runtime.ToolCallResponseEvent{}), target: "B"},
+		{msg: runtime.StreamStopped("B", "b", "normal"), target: "B"},
+		// Both delegation results land in the parent.
+		{msg: &runtime.ToolCallResponseEvent{}},
+		{msg: &runtime.ToolCallResponseEvent{}},
 	})
-}
-
-func TestSubAgentRouter_RootBoundaryClearsStaleChildren(t *testing.T) {
-	t.Parallel()
-
-	runRouteSteps(t, newSubAgentRouter(), []routeStep{
-		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: "ship", drop: true},
-		{msg: &runtime.ToolCallEvent{}, target: "ship"},
-		{msg: runtime.StreamStopped("root", "firstmate", "canceled")},
-		{msg: &runtime.ToolCallEvent{}},
-	})
+	assert.Same(t, confirmB, r.route(wrap("B", confirmB)).msg, "wrapped events are delivered unwrapped")
 }
 
 func TestSubAgentRouter_BackgroundAgentUnwrapsIntoItsTab(t *testing.T) {
 	t.Parallel()
 
 	inner := &runtime.ToolCallEvent{}
-	r := newSubAgentRouter()
-	runRouteSteps(t, r, []routeStep{
-		{msg: runtime.SubSessionStarted("root", "bg", "scout", "survey", true), open: "bg", drop: true},
+	bg := func(ev runtime.Event) runtime.Event { return runtime.SubSessionStream("bg", "scout", true, ev) }
+	runRouteSteps(t, newSubAgentRouter(), []routeStep{
+		{msg: runtime.SubSessionStarted("root", "bg", "scout", "survey", true), open: []string{"bg"}, drop: true},
 		// The foreground keeps streaming in the parent while the background agent runs.
 		{msg: &runtime.ToolCallEvent{}},
-		{msg: runtime.BackgroundSubSession("bg", "scout", runtime.StreamStarted("bg", "scout")), target: "bg"},
-		{msg: runtime.BackgroundSubSession("bg", "scout", inner), target: "bg"},
-		{msg: runtime.BackgroundSubSession("bg", "scout", runtime.SubSessionStarted("bg", "nested", "ship", "", false)), drop: true},
+		{msg: bg(runtime.StreamStarted("bg", "scout")), target: "bg"},
+		{msg: bg(inner), target: "bg"},
 		{msg: &runtime.ElicitationRequestEvent{SessionID: "bg"}, target: "bg"},
 		{msg: &runtime.TokenUsageEvent{SessionID: "bg"}},
 		{msg: &runtime.AgentChoiceEvent{SessionID: "root"}},
+		// A background agent's own transfer_task gets a tab too.
+		{msg: bg(runtime.SubSessionStarted("bg", "nested", "ship", "", false)), open: []string{"nested"}, drop: true},
+		{msg: bg(runtime.StreamStarted("nested", "ship")), target: "nested"},
+		{msg: bg(wrap("nested", confirmation("ship"))), target: "nested"},
 		// Late subscribers open the tab on the first wrapped event.
-		{msg: runtime.BackgroundSubSession("late", "ship", inner), open: "late", target: "late"},
-		{msg: runtime.BackgroundSubSession("late", "ship", inner), target: "late"},
+		{msg: runtime.SubSessionStream("late", "ship", true, inner), open: []string{"late"}, target: "late"},
+		{msg: runtime.SubSessionStream("late", "ship", true, inner), target: "late"},
 	})
-	assert.Same(t, inner, r.route(runtime.BackgroundSubSession("bg", "scout", inner), "root").msg, "wrapped events are delivered unwrapped")
 }
 
-func TestSubAgentRouter_AppNoticesStayWithParent(t *testing.T) {
+func TestSubAgentRouter_UntaggedEventsStayWithParent(t *testing.T) {
 	t.Parallel()
 
 	runRouteSteps(t, newSubAgentRouter(), []routeStep{
-		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: "ship", drop: true},
-		// Concurrent app-level notices are not part of the child's stream.
+		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: []string{"ship"}, drop: true},
+		{msg: runtime.StreamStarted("ship", "ship"), target: "ship"},
+		// While a child streams, unwrapped events are app-level or the parent's own.
 		{msg: messages.StreamCancelledMsg{}},
 		{msg: &runtime.ToolsetInfoEvent{}},
 		{msg: &runtime.MCPInitStartedEvent{}},
 		{msg: &runtime.RAGIndexingStartedEvent{}},
 		{msg: &runtime.PlanChangedEvent{}},
 		{msg: &runtime.ShellOutputEvent{}},
-		{msg: &runtime.TeamInfoEvent{}},
-		// Untagged events of the child's own run loop follow it.
-		{msg: &runtime.AgentInfoEvent{}, target: "ship"},
-		{msg: &runtime.WarningEvent{}, target: "ship"},
-		{msg: &runtime.MaxIterationsReachedEvent{}, target: "ship"},
-		{msg: &runtime.ToolCallOutputEvent{}, target: "ship"},
+		{msg: &runtime.AgentInfoEvent{}},
+		{msg: &runtime.MaxIterationsReachedEvent{}},
 	})
 }
 
@@ -151,9 +156,9 @@ func TestRouteSubAgentMsg_OpensTabNextToParentAndRoutes(t *testing.T) {
 	var sent []tea.Msg
 	send := func(msg tea.Msg) { sent = append(sent, msg) }
 
-	s.routeSubAgentMsg(send, router, "A", parent, parent.Scope, runtime.SubSessionStarted("A", "ship", "ship", "fix it", false))
-	s.routeSubAgentMsg(send, router, "A", parent, parent.Scope, runtime.StreamStarted("ship", "ship"))
-	s.routeSubAgentMsg(send, router, "A", parent, parent.Scope, runtime.SubSessionStarted("A", "bg", "scout", "", true))
+	s.routeSubAgentMsg(send, router, "A", parent.Scope, runtime.SubSessionStarted("A", "ship", "ship", "fix it", false))
+	s.routeSubAgentMsg(send, router, "A", parent.Scope, runtime.StreamStarted("ship", "ship"))
+	s.routeSubAgentMsg(send, router, "A", parent.Scope, runtime.SubSessionStarted("A", "bg", "scout", "", true))
 
 	assert.Equal(t, []string{"A", "ship", "bg", "B"}, s.order, "sub-agent tabs group after their parent")
 	assert.Equal(t, "A", s.activeID, "opening a sub-agent tab must not steal focus")
@@ -182,34 +187,36 @@ func TestRouteSubAgentMsg_ClosedTabStillSurfacesPrompts(t *testing.T) {
 	t.Parallel()
 
 	s := newTestSupervisor([]string{"A"}, "A")
-	parent := s.runners["A"]
 	scope := &messages.RouteScope{}
 	router := newSubAgentRouter()
 	var sent []tea.Msg
 	send := func(msg tea.Msg) { sent = append(sent, msg) }
-	route := func(msg tea.Msg) { s.routeSubAgentMsg(send, router, "A", parent, scope, msg) }
+	route := func(msg tea.Msg) { s.routeSubAgentMsg(send, router, "A", scope, msg) }
 
 	route(runtime.SubSessionStarted("A", "ship", "ship", "", false))
 	route(runtime.SubSessionStarted("A", "bg", "scout", "", true))
 	route(runtime.StreamStarted("ship", "ship"))
 	assert.Equal(t, "A", s.CloseSession("ship"))
 	assert.Equal(t, "A", s.CloseSession("bg"))
+	assert.Equal(t, "A", s.ClosedSubAgentParent("ship"))
+	assert.Empty(t, s.ClosedSubAgentParent("A"))
 	sent = nil
 
 	// Display-only events of a hidden sub-agent are dropped, not leaked into the parent.
-	route(&runtime.ToolCallEvent{})
+	route(wrap("ship", &runtime.ToolCallEvent{}))
 	route(&runtime.AgentChoiceEvent{SessionID: "ship"})
-	route(runtime.BackgroundSubSession("bg", "scout", &runtime.ToolCallEvent{}))
+	route(runtime.SubSessionStream("bg", "scout", true, &runtime.ToolCallEvent{}))
 	assert.Empty(t, sent)
 
 	// The runtime blocks on these until answered: they must still reach the user.
-	confirm := &runtime.ToolCallConfirmationEvent{}
+	confirm := confirmation("ship")
 	maxIter := &runtime.MaxIterationsReachedEvent{}
 	fgElicit := &runtime.ElicitationRequestEvent{SessionID: "ship"}
 	bgElicit := &runtime.ElicitationRequestEvent{SessionID: "bg"}
-	for _, prompt := range []tea.Msg{confirm, maxIter, fgElicit, bgElicit} {
-		route(prompt)
-	}
+	route(wrap("ship", confirm))
+	route(wrap("ship", maxIter))
+	route(fgElicit)
+	route(bgElicit)
 	require.Len(t, sent, 4)
 	for i, prompt := range []tea.Msg{confirm, maxIter, fgElicit, bgElicit} {
 		routed, ok := sent[i].(messages.RoutedMsg)
@@ -218,12 +225,6 @@ func TestRouteSubAgentMsg_ClosedTabStillSurfacesPrompts(t *testing.T) {
 		assert.Same(t, scope, routed.Scope)
 		assert.Same(t, prompt, routed.Inner)
 	}
-
-	sent = nil
-	route(runtime.StreamStopped("ship", "ship", "normal"))
-	route(&runtime.ToolCallEvent{})
-	require.Len(t, sent, 1, "the parent's own events resume once the child stops")
-	assert.Equal(t, "A", sent[0].(messages.RoutedMsg).SessionID)
 	assert.Equal(t, []string{"A"}, s.order, "closed sub-agent tabs are not reopened")
 }
 

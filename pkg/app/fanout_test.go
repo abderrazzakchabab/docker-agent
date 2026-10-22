@@ -84,3 +84,28 @@ func TestFanOut_DroppableEventIsDroppedOnOverflow(t *testing.T) {
 	msg := <-ch
 	assert.Equal(t, first, msg)
 }
+
+// TestIsTurnBoundaryEvent_LooksInsideSubSessionWrappers verifies that
+// sub-session boundaries and prompts survive overflow even when the runtime
+// wrapped them for attribution, while wrapped deltas stay droppable.
+func TestIsTurnBoundaryEvent_LooksInsideSubSessionWrappers(t *testing.T) {
+	t.Parallel()
+
+	wrap := func(ev runtime.Event) runtime.Event { return runtime.SubSessionStream("child", "ship", false, ev) }
+	bg := func(ev runtime.Event) runtime.Event { return runtime.SubSessionStream("bg", "scout", true, ev) }
+	protected := map[string]tea.Msg{
+		"announcement":         runtime.SubSessionStarted("root", "child", "ship", "task", false),
+		"wrapped stop":         wrap(runtime.StreamStopped("child", "ship", "normal")),
+		"wrapped confirmation": wrap(&runtime.ToolCallConfirmationEvent{}),
+		"wrapped max iter":     wrap(&runtime.MaxIterationsReachedEvent{}),
+		"wrapped elicitation":  wrap(&runtime.ElicitationRequestEvent{}),
+		"nested stop":          bg(wrap(runtime.StreamStopped("child", "ship", "normal"))),
+		"nested announcement":  bg(runtime.SubSessionStarted("bg", "child", "ship", "", false)),
+	}
+	for name, msg := range protected {
+		assert.True(t, isTurnBoundaryEvent(msg), name)
+	}
+	assert.False(t, isTurnBoundaryEvent(wrap(&runtime.AgentChoiceEvent{})), "wrapped deltas stay droppable")
+	assert.False(t, isTurnBoundaryEvent(bg(&runtime.ToolCallOutputEvent{})))
+	assert.False(t, isTurnBoundaryEvent(&runtime.ToolCallConfirmationEvent{}), "unwrapped events keep their existing policy")
+}

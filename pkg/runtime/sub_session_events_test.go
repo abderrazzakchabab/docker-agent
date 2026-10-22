@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,8 +90,9 @@ func TestRunAgent_ForwardsWrappedStreamWhenEnabled(t *testing.T) {
 
 	var inner []Event
 	for _, event := range forwarded[1:] {
-		if wrapped, ok := event.(*BackgroundSubSessionEvent); ok {
+		if wrapped, ok := event.(*SubSessionStreamEvent); ok {
 			assert.Equal(t, child.ID, wrapped.SessionID)
+			assert.True(t, wrapped.Background)
 			inner = append(inner, wrapped.Event)
 		}
 	}
@@ -103,5 +105,78 @@ func TestRunAgent_ForwardsWrappedStreamWhenEnabled(t *testing.T) {
 	for _, event := range inner {
 		_, isUsage := event.(*TokenUsageEvent)
 		assert.False(t, isUsage, "token usage stays unwrapped for the parent's accounting")
+	}
+}
+
+// transfer_task calls of one model turn run concurrently and share the
+// parent's sink: every untagged child event must be wrapped with its own
+// child's session ID, and only when sub-session events are enabled.
+func TestTransferTask_ConcurrentChildrenAreAttributedAtSource(t *testing.T) {
+	t.Parallel()
+
+	for _, enabled := range []bool{false, true} {
+		a := probeAgent("a", "a done", func() {})
+		b := probeAgent("b", "b done", func() {})
+		root := agent.New("root", "Root agent", agent.WithModel(&mockProvider{id: "test/mock-model", stream: &mockStream{}}))
+		agent.WithSubAgents(a, b)(root)
+		rt, err := NewLocalRuntime(t.Context(), team.New(team.WithAgents(root, a, b)),
+			WithSessionCompaction(false), WithModelStore(mockModelStore{}))
+		require.NoError(t, err)
+		if enabled {
+			rt.EnableSubSessionEvents()
+		}
+
+		// A pinned parent pins each child to its target: unpinned concurrent
+		// children share the runtime's current agent, which would blur the
+		// per-agent attribution this test checks.
+		parent := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true), session.WithAgentName("root"))
+		evts := make(chan Event, 512)
+		sink := NewChannelSink(evts)
+		results := make(map[string]string)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, target := range []string{"a", "b"} {
+			wg.Go(func() {
+				res, err := rt.handleTaskTransfer(t.Context(), parent, transferToolCall(target), sink, tools.NopRuntime{})
+				assert.NoError(t, err)
+				mu.Lock()
+				defer mu.Unlock()
+				results[target] = res.Output
+			})
+		}
+		wg.Wait()
+		close(evts)
+		assert.Equal(t, map[string]string{"a": "a done", "b": "b done"}, results, "both results reach the parent")
+
+		childOf := make(map[string]string) // sub-session ID -> agent
+		var wrapped, rawToolEvents int
+		for event := range evts {
+			switch ev := event.(type) {
+			case *SubSessionStartedEvent:
+				childOf[ev.SessionID] = ev.AgentName
+			case *SubSessionStreamEvent:
+				wrapped++
+				require.Contains(t, childOf, ev.SessionID, "wrappers follow their announcement")
+				assert.False(t, ev.Background)
+				assert.Equal(t, childOf[ev.SessionID], ev.Event.GetAgentName(), "event attributed to its own child")
+				_, tagged := ev.Event.(SessionScoped)
+				assert.False(t, tagged && ev.Event.(SessionScoped).GetSessionID() != "", "tagged events are not wrapped")
+			case *StreamStartedEvent:
+				if enabled {
+					assert.Equal(t, childOf[ev.SessionID], ev.AgentName, "tagged child events carry their own ID")
+				}
+			case *PartialToolCallEvent, *ToolCallEvent, *ToolCallResponseEvent:
+				rawToolEvents++
+			}
+		}
+		if !enabled {
+			assert.Empty(t, childOf, "no announcements without opt-in")
+			assert.Zero(t, wrapped, "flag off: child events stay unwrapped")
+			assert.NotZero(t, rawToolEvents)
+			continue
+		}
+		assert.Len(t, childOf, 2)
+		assert.NotZero(t, wrapped)
+		assert.Zero(t, rawToolEvents, "no child tool event reaches the parent stream unattributed")
 	}
 }

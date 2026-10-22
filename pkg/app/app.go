@@ -1121,7 +1121,19 @@ func (a *App) startFanOut() {
 // These are low-frequency and irrecoverable when lost, unlike the content
 // deltas that dominate the stream, so the fan-out prefers them on overflow.
 func isTurnBoundaryEvent(msg tea.Msg) bool {
-	switch msg.(type) {
+	switch ev := msg.(type) {
+	case *runtime.SubSessionStartedEvent:
+		// Opens the sub-session's view; everything it streams is attributed to it.
+		return true
+	case *runtime.SubSessionStreamEvent:
+		// A wrapped prompt is as irrecoverable as a boundary: the sub-session
+		// blocks on it until answered.
+		switch inner := runtime.InnermostEvent(ev); inner.(type) {
+		case *runtime.ToolCallConfirmationEvent, *runtime.MaxIterationsReachedEvent, *runtime.ElicitationRequestEvent:
+			return true
+		default:
+			return isTurnBoundaryEvent(inner)
+		}
 	case *runtime.StreamStartedEvent,
 		*runtime.StreamStoppedEvent,
 		*runtime.UserMessageEvent,

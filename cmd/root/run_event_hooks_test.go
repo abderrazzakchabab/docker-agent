@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/runtime"
 )
 
 func TestParseOnEventFlags(t *testing.T) {
@@ -59,4 +61,23 @@ func TestBoundedWriter_CapsAtMaxHookOutput(t *testing.T) {
 	assert.Len(t, got, maxHookOutput)
 	assert.True(t, strings.HasPrefix(got, strings.Repeat("a", maxHookOutput-3)))
 	assert.True(t, strings.HasSuffix(got, "bbb"))
+}
+
+func TestHookEventIgnoresSubAgentTabWrapping(t *testing.T) {
+	t.Parallel()
+
+	toolCall := &runtime.ToolCallEvent{}
+	ev, ok := hookEvent(runtime.SubSessionStream("child", "ship", false, toolCall))
+	require.True(t, ok)
+	assert.Same(t, toolCall, ev, "transfer_task events reach hooks bare, as without --sub-agent-tabs")
+
+	_, ok = hookEvent(runtime.SubSessionStream("bg", "scout", true, toolCall))
+	assert.False(t, ok, "background streams never reached hooks")
+	_, ok = hookEvent(runtime.SubSessionStarted("root", "child", "ship", "", false))
+	assert.False(t, ok)
+
+	stop := runtime.StreamStopped("root", "root", "normal")
+	ev, ok = hookEvent(stop)
+	require.True(t, ok)
+	assert.Same(t, stop, ev)
 }

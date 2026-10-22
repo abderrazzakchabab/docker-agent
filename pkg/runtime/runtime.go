@@ -1628,9 +1628,10 @@ func (r *LocalRuntime) OnBackgroundEvent(handler func(Event)) {
 
 // EnableSubSessionEvents makes the runtime announce delegated sub-sessions
 // (transfer_task, run_background_agent) with a SubSessionStartedEvent and
-// forward each background sub-session event, wrapped in a
-// BackgroundSubSessionEvent, through the OnBackgroundEvent handler. Off by
-// default so embedders that don't render sub-sessions see no new events.
+// attribute their events with SubSessionStreamEvent: untagged transfer_task
+// events on the parent's stream, and every background event through the
+// OnBackgroundEvent handler. Off by default so embedders that don't render
+// sub-sessions see no new events.
 func (r *LocalRuntime) EnableSubSessionEvents() {
 	r.subSessionEvents.Store(true)
 }

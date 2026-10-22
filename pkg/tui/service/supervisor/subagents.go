@@ -8,7 +8,6 @@ import (
 
 	"github.com/docker/docker-agent/pkg/app"
 	"github.com/docker/docker-agent/pkg/runtime"
-	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/tui/messages"
 	"github.com/docker/docker-agent/pkg/tui/service/tabstate"
 )
@@ -18,123 +17,61 @@ const subAgentTitleWords = 6
 
 // subAgentRoute says where one message of a tab's subscription goes.
 type subAgentRoute struct {
-	open   *runtime.SubSessionStartedEvent // tab to open before delivering msg
-	target string                          // sub-agent tab ID; "" is the subscribing tab
-	msg    tea.Msg                         // nil when nothing is delivered
+	open   []*runtime.SubSessionStartedEvent // tabs to open before delivering msg
+	target string                            // sub-agent tab ID; "" is the subscribing tab
+	msg    tea.Msg                           // nil when nothing is delivered
 }
 
-// subAgentRouter attributes one tab subscription's events to sub-agent tabs.
-// transfer_task children stream inline on the parent's channel, so events
-// without a session ID (tool calls, confirmations) belong to the innermost
-// open child; background children arrive wrapped with their session ID.
+// subAgentRouter attributes one tab subscription's events to sub-agent tabs
+// by session ID only: the runtime tags or wraps (SubSessionStreamEvent) every
+// event of an announced sub-session, so concurrent children never mix.
 // Used only from the subscription goroutine.
 type subAgentRouter struct {
 	known map[string]bool
-	stack []string
 }
 
 func newSubAgentRouter() *subAgentRouter {
 	return &subAgentRouter{known: make(map[string]bool)}
 }
 
-func (r *subAgentRouter) route(msg tea.Msg, rootID string) subAgentRoute {
-	switch ev := msg.(type) {
-	case *runtime.SubSessionStartedEvent:
-		r.known[ev.SessionID] = true
-		if !ev.Background {
-			r.stack = append(r.stack, ev.SessionID)
-		}
-		return subAgentRoute{open: ev}
-	case *runtime.BackgroundSubSessionEvent:
-		var open *runtime.SubSessionStartedEvent
-		if !r.known[ev.SessionID] {
-			// A subscription started mid-task never saw the announcement.
-			r.known[ev.SessionID] = true
-			open = &runtime.SubSessionStartedEvent{SessionID: ev.SessionID, AgentContext: ev.AgentContext, Background: true}
-		}
-		// Nested delegations of a background agent render inline in its tab.
-		if _, nested := ev.Event.(*runtime.SubSessionStartedEvent); nested {
-			return subAgentRoute{open: open}
-		}
-		return subAgentRoute{open: open, target: ev.SessionID, msg: ev.Event}
-	case *runtime.TokenUsageEvent:
-		// Usage stays with the parent's sidebar and cost accounting.
-		return subAgentRoute{msg: msg}
-	case *runtime.SubSessionCompletedEvent:
-		// Backstop for a child whose stream never reported its stop.
-		if sub, ok := ev.SubSession.(*session.Session); ok {
-			r.closeStream(sub.ID)
-		}
-		return subAgentRoute{msg: msg}
-	}
-	if _, ok := msg.(runtime.Event); !ok {
-		return subAgentRoute{msg: msg}
-	}
-	if scoped, ok := msg.(runtime.SessionScoped); ok {
-		switch id := scoped.GetSessionID(); {
-		case id != "" && id == rootID:
-			if isStreamBoundary(msg) {
-				r.stack = nil
+func (r *subAgentRouter) route(msg tea.Msg) subAgentRoute {
+	var route subAgentRoute
+	for {
+		switch ev := msg.(type) {
+		case *runtime.SubSessionStartedEvent:
+			if !r.known[ev.SessionID] {
+				r.known[ev.SessionID] = true
+				route.open = append(route.open, ev)
 			}
-			return subAgentRoute{msg: msg}
-		case r.known[id]:
-			switch msg.(type) {
-			case *runtime.StreamStartedEvent:
-				if n := len(r.stack); n == 0 || r.stack[n-1] != id {
-					r.stack = append(r.stack, id)
-				}
-			case *runtime.StreamStoppedEvent:
-				r.closeStream(id)
+			return subAgentRoute{open: route.open}
+		case *runtime.SubSessionStreamEvent:
+			if !r.known[ev.SessionID] {
+				// A subscription started mid-task never saw the announcement.
+				r.known[ev.SessionID] = true
+				route.open = append(route.open, &runtime.SubSessionStartedEvent{SessionID: ev.SessionID, AgentContext: ev.AgentContext, Background: ev.Background})
 			}
-			return subAgentRoute{target: id, msg: msg}
+			route.target = ev.SessionID
+			msg = ev.Event
+			continue
+		case *runtime.TokenUsageEvent:
+			// Usage stays with the parent's sidebar and cost accounting.
+			return subAgentRoute{open: route.open, msg: msg}
 		}
+		break
 	}
-	if n := len(r.stack); n > 0 && inStream(msg) {
-		return subAgentRoute{target: r.stack[n-1], msg: msg}
+	// Tagged events of non-delegation sessions (skills) stay with the
+	// enclosing sub-agent, or the subscribing tab.
+	if scoped, ok := msg.(runtime.SessionScoped); ok && r.known[scoped.GetSessionID()] {
+		route.target = scoped.GetSessionID()
 	}
-	return subAgentRoute{msg: msg}
+	route.msg = msg
+	return route
 }
 
-// inStream reports whether an event without a known session belongs to the
-// stream it interrupts: tagged events of nested non-delegation sessions (skills)
-// and the untagged types a run loop emits. App-level notices that can arrive
-// concurrently (toolset changes, MCP init, RAG indexing, plans, shell output)
-// stay with the subscribing tab.
-func inStream(msg tea.Msg) bool {
-	if scoped, ok := msg.(runtime.SessionScoped); ok && scoped.GetSessionID() != "" {
-		return true
-	}
-	switch msg.(type) {
-	case *runtime.PartialToolCallEvent, *runtime.ToolCallEvent, *runtime.ToolCallConfirmationEvent,
-		*runtime.ToolCallOutputEvent, *runtime.ToolCallResponseEvent, *runtime.MaxIterationsReachedEvent,
-		*runtime.WarningEvent, *runtime.ModelFallbackEvent, *runtime.AuthorizationEvent,
-		*runtime.HookBlockedEvent, *runtime.AgentInfoEvent, *runtime.AgentSwitchingEvent:
-		return true
-	default:
-		return false
-	}
-}
-
-// isAttention reports prompts the runtime blocks on until the user answers.
-func isAttention(msg tea.Msg) bool {
+// IsAttention reports prompts the runtime blocks on until the user answers.
+func IsAttention(msg tea.Msg) bool {
 	switch msg.(type) {
 	case *runtime.ToolCallConfirmationEvent, *runtime.MaxIterationsReachedEvent, *runtime.ElicitationRequestEvent:
-		return true
-	default:
-		return false
-	}
-}
-
-// closeStream pops id along with any children left open above it.
-func (r *subAgentRouter) closeStream(id string) {
-	if i := slices.Index(r.stack, id); i >= 0 {
-		r.stack = r.stack[:i]
-	}
-}
-
-func isStreamBoundary(msg tea.Msg) bool {
-	switch msg.(type) {
-	case *runtime.StreamStartedEvent, *runtime.StreamStoppedEvent:
 		return true
 	default:
 		return false
@@ -163,10 +100,12 @@ func (s *Supervisor) EnableSubAgentTabs() {
 
 // routeSubAgentMsg delivers one message of parentID's subscription, opening a
 // sub-agent tab first when the runtime announces a new sub-session.
-func (s *Supervisor) routeSubAgentMsg(send func(tea.Msg), router *subAgentRouter, parentID string, parent *SessionRunner, scope *messages.RouteScope, msg tea.Msg) {
-	route := router.route(msg, parent.State.SessionID())
-	if route.open != nil && s.AddSubAgentTab(parentID, route.open) {
-		send(messages.SubAgentTabOpenedMsg{TabID: route.open.SessionID})
+func (s *Supervisor) routeSubAgentMsg(send func(tea.Msg), router *subAgentRouter, parentID string, scope *messages.RouteScope, msg tea.Msg) {
+	route := router.route(msg)
+	for _, open := range route.open {
+		if s.AddSubAgentTab(parentID, open) {
+			send(messages.SubAgentTabOpenedMsg{TabID: open.SessionID})
+		}
 	}
 	if route.msg == nil {
 		return
@@ -182,7 +121,7 @@ func (s *Supervisor) routeSubAgentMsg(send func(tea.Msg), router *subAgentRouter
 		// A closed sub-agent tab only hid the view: its session keeps running
 		// and may still block on a prompt, which then surfaces in the parent
 		// tab exactly as it would without sub-agent tabs.
-		if !isAttention(route.msg) {
+		if !IsAttention(route.msg) {
 			return
 		}
 	}
@@ -237,4 +176,11 @@ func (s *Supervisor) SubAgentTabIDs(parentID string) []string {
 		}
 	}
 	return ids
+}
+
+// ClosedSubAgentParent returns the parent tab of a closed sub-agent tab, or "".
+func (s *Supervisor) ClosedSubAgentParent(tabID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closedSubAgents[tabID]
 }

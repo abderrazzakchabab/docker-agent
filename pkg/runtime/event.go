@@ -1189,26 +1189,42 @@ func SubSessionStarted(parentSessionID, sessionID, agentName, task string, backg
 
 func (e *SubSessionStartedEvent) GetSessionID() string { return e.SessionID }
 
-// BackgroundSubSessionEvent carries one event of a background sub-session's
-// stream, which otherwise never leaves the runtime. The wrapper attributes
-// events that carry no session ID of their own (tool calls, confirmations).
-// Emitted only after [LocalRuntime.EnableSubSessionEvents]. Local-only: the
-// remote client cannot decode the interface-typed Event from JSON.
-type BackgroundSubSessionEvent struct {
+// SubSessionStreamEvent attributes one event of a delegated sub-session to
+// that sub-session. transfer_task children wrap the events that carry no
+// session ID of their own (tool calls, confirmations), so concurrent children
+// stay distinguishable on the parent's stream. Background children, whose
+// stream otherwise never leaves the runtime, wrap every forwarded event and
+// may nest a child's own wrappers. Emitted only after
+// [LocalRuntime.EnableSubSessionEvents]. Local-only: the remote client cannot
+// decode the interface-typed Event from JSON.
+type SubSessionStreamEvent struct {
 	AgentContext
 
-	Type      string `json:"type"`
-	SessionID string `json:"session_id"`
-	Event     Event  `json:"event"`
+	Type       string `json:"type"`
+	SessionID  string `json:"session_id"`
+	Background bool   `json:"background,omitempty"`
+	Event      Event  `json:"event"`
 }
 
-func BackgroundSubSession(sessionID, agentName string, event Event) Event {
-	return &BackgroundSubSessionEvent{
-		Type:         "background_sub_session",
+func SubSessionStream(sessionID, agentName string, background bool, event Event) Event {
+	return &SubSessionStreamEvent{
+		Type:         "sub_session_stream",
 		SessionID:    sessionID,
+		Background:   background,
 		Event:        event,
 		AgentContext: newAgentContext(agentName),
 	}
 }
 
-func (e *BackgroundSubSessionEvent) GetSessionID() string { return e.SessionID }
+func (e *SubSessionStreamEvent) GetSessionID() string { return e.SessionID }
+
+// InnermostEvent returns the event wrapped by any SubSessionStreamEvents.
+func InnermostEvent(event Event) Event {
+	for {
+		wrapped, ok := event.(*SubSessionStreamEvent)
+		if !ok || wrapped.Event == nil {
+			return event
+		}
+		event = wrapped.Event
+	}
+}

@@ -1557,6 +1557,15 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleRoutedMsg processes messages routed to specific sessions.
 func (m *appModel) handleRoutedMsg(msg messages.RoutedMsg) (tea.Model, tea.Cmd) {
 	runner := m.supervisor.GetRunner(msg.SessionID)
+	if runner == nil && supervisor.IsAttention(msg.Inner) {
+		// The sub-agent tab closed while this prompt was in flight; its
+		// sub-session keeps running and still waits on the answer.
+		if parentID := m.supervisor.ClosedSubAgentParent(msg.SessionID); parentID != "" {
+			if parent := m.supervisor.GetRunner(parentID); parent != nil {
+				return m.handleRoutedMsg(messages.RoutedMsg{SessionID: parentID, Scope: parent.Scope, Inner: msg.Inner})
+			}
+		}
+	}
 	if msg.Scope != nil && (runner == nil || runner.Scope != msg.Scope) {
 		return m, nil
 	}
