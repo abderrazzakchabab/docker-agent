@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"reflect"
+
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/docker/docker-agent/pkg/tui/components/editor"
@@ -52,30 +54,54 @@ func (m *appModel) isSubAgentTab(tabID string) bool {
 	return runner != nil && runner.ParentID != ""
 }
 
-// rejectInSubAgentTab refuses commands that would act on a sub-agent tab's
-// placeholder session (persisting, running or rewriting it) or steer the
-// shared runtime from a read-only view. Returns nil when msg may proceed.
+// messagesPkg identifies the TUI's command and notification message types.
+var messagesPkg = reflect.TypeFor[messages.RoutedMsg]().PkgPath()
+
+// rejectInSubAgentTab gates TUI commands while a sub-agent tab is active. The
+// tab is a read-only view whose App borrows the delegating tab's runtime, so
+// only an allowlist passes: answering its dialogs, tab navigation, scrolling,
+// copying, help, quitting, opening sessions in a new tab, and the internal
+// notifications every tab needs. Returns nil when msg may proceed.
 func (m *appModel) rejectInSubAgentTab(msg tea.Msg) tea.Cmd {
-	switch msg := msg.(type) {
-	case messages.ToggleSessionStarMsg:
-		// The session browser stars a named session; only the current one is a placeholder.
-		if msg.SessionID != "" {
-			return nil
-		}
-	case messages.ClearSessionMsg, messages.SwitchAgentMsg, messages.BranchFromEditMsg,
-		messages.ForkSessionMsg, messages.ToggleYoloMsg, messages.TogglePauseMsg,
-		messages.CompactSessionMsg, messages.UndoSnapshotMsg, messages.ResetSnapshotMsg,
-		messages.EvalSessionMsg, messages.SetSessionTitleMsg,
-		messages.RegenerateTitleMsg, messages.DropAttachedFileMsg, messages.AttachFileMsg,
-		messages.AgentCommandMsg, messages.StartShellMsg, messages.ShowMCPPromptInputMsg,
-		messages.MCPPromptMsg:
-	default:
+	t := reflect.TypeOf(msg)
+	if t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil || t.PkgPath() != messagesPkg || allowedInSubAgentTab(msg) {
 		return nil
 	}
 	if m.supervisor == nil || !m.isSubAgentTab(m.supervisor.ActiveID()) {
 		return nil
 	}
 	return notification.WarningCmd("Sub-agent tabs are read-only views. Run this from the delegating tab.")
+}
+
+func allowedInSubAgentTab(msg tea.Msg) bool {
+	switch msg.(type) {
+	// Internal notifications and routing.
+	case messages.RoutedMsg, messages.TabsUpdatedMsg, messages.SubAgentTabOpenedMsg,
+		messages.WorkingStateChangedMsg, messages.InvalidateStatusBarMsg, messages.WheelCoalescedMsg,
+		messages.RequestFocusMsg, messages.BellMsg, messages.StreamCancelledMsg,
+		messages.PlanSidebarDataMsg, messages.RefreshPlansMsg, messages.ThemeFileChangedMsg,
+		messages.ExitAfterFirstResponseMsg, messages.RestorePendingMessagesMsg,
+		messages.SessionToggleChangedMsg, messages.TourFinishedMsg:
+		return true
+	// Answering the tab's prompts.
+	case messages.ElicitationResponseMsg:
+		return true
+	// Tab navigation; new sessions always open in a new tab.
+	case messages.SwitchTabMsg, messages.CloseTabMsg, messages.ReorderTabMsg,
+		messages.SpawnSessionMsg, messages.NewSessionMsg,
+		messages.OpenSessionBrowserMsg, messages.LoadSessionMsg:
+		return true
+	// Viewing, copying, help and quitting.
+	case messages.ToggleSidebarMsg, messages.CopySessionToClipboardMsg,
+		messages.CopyLastResponseToClipboardMsg, messages.OpenURLMsg,
+		messages.StartTourMsg, messages.ExitSessionMsg:
+		return true
+	default:
+		return false
+	}
 }
 
 // handOffSubAgentAttention moves a closing sub-agent tab's unanswered prompts,

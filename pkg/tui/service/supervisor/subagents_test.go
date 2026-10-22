@@ -59,9 +59,13 @@ func TestSubAgentRouter_TransferTaskStreamsToChildTab(t *testing.T) {
 		{msg: wrap("ship", &runtime.ToolCallResponseEvent{}), target: "ship"},
 		{msg: &runtime.TokenUsageEvent{SessionID: "ship"}},
 		{msg: &runtime.ElicitationRequestEvent{SessionID: "ship"}, target: "ship"},
-		// A skill run by the child streams inline in the child's tab.
-		{msg: runtime.StreamStarted("skill", "ship")},
+		// The app throttle merges deltas per session, keeping their ID.
+		{msg: runtime.AgentChoice("ship", "ship", "merged delta"), target: "ship"},
+		// A skill run by the child arrives wrapped by the child and streams in
+		// its tab; its bare prompts follow it there.
 		{msg: wrap("ship", runtime.StreamStarted("skill", "ship")), target: "ship"},
+		{msg: wrap("ship", runtime.AgentChoice("ship", "skill", "skill output")), target: "ship"},
+		{msg: &runtime.ElicitationRequestEvent{SessionID: "skill"}, target: "ship"},
 		{msg: runtime.StreamStopped("ship", "ship", "normal"), target: "ship"},
 		{msg: runtime.SubSessionCompleted("root", session.New(session.WithID("ship")), "firstmate")},
 		{msg: &runtime.ToolCallResponseEvent{}},
@@ -237,4 +241,43 @@ func TestAddSubAgentTab_RejectsUnknownOrNestedParents(t *testing.T) {
 	require.True(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{SessionID: "ship"}))
 	assert.False(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{SessionID: "ship"}), "no duplicates")
 	assert.False(t, s.AddSubAgentTab("ship", &runtime.SubSessionStartedEvent{SessionID: "scout"}), "sub-agent tabs group under the subscribing tab")
+}
+
+func TestSubAgentRouter_UnknownSessionsStayWithParent(t *testing.T) {
+	t.Parallel()
+
+	runRouteSteps(t, newSubAgentRouter(), []routeStep{
+		{msg: runtime.SubSessionStarted("root", "ship", "ship", "", false), open: []string{"ship"}, drop: true},
+		// The parent's own skill is never wrapped and stays inline.
+		{msg: runtime.StreamStarted("parent-skill", "root")},
+		{msg: &runtime.ElicitationRequestEvent{SessionID: "parent-skill"}},
+	})
+}
+
+func TestClosedSubAgentRecordsAreBounded(t *testing.T) {
+	t.Parallel()
+
+	s := newTestSupervisor([]string{"A", "B"}, "A")
+	router := newSubAgentRouter()
+	send := func(tea.Msg) {}
+	route := func(msg tea.Msg) { s.routeSubAgentMsg(send, router, "A", nil, msg) }
+	route(runtime.SubSessionStarted("A", "ship", "ship", "", false))
+	route(runtime.SubSessionStarted("A", "bg", "scout", "", true))
+	route(runtime.SubSessionStarted("A", "late", "scout", "", false))
+	s.CloseSession("ship")
+	s.CloseSession("bg")
+	s.CloseSession("late")
+	require.Equal(t, "A", s.ClosedSubAgentParent("ship"))
+
+	assert.False(t, s.AddSubAgentTab("A", &runtime.SubSessionStartedEvent{SessionID: "ship"}),
+		"a fresh subscription (after ReplaceRunnerApp) must not reopen a tab the user closed")
+
+	route(runtime.SubSessionCompleted("A", session.New(session.WithID("ship")), "root"))
+	assert.Empty(t, s.ClosedSubAgentParent("ship"), "a completed transfer_task child can no longer prompt")
+	route(runtime.SubSessionStream("bg", "scout", true, runtime.StreamStopped("bg", "scout", "normal")))
+	assert.Empty(t, s.ClosedSubAgentParent("bg"), "a background child's own stream stop is its last event")
+
+	require.Equal(t, "A", s.ClosedSubAgentParent("late"))
+	s.CloseSession("A")
+	assert.Empty(t, s.ClosedSubAgentParent("late"), "closing the parent forgets its children")
 }

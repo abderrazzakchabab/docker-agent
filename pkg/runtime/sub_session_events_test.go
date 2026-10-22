@@ -4,15 +4,18 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/tools"
 	agenttool "github.com/docker/docker-agent/pkg/tools/builtin/agent"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 )
 
 func newSubSessionEventsRuntime(t *testing.T) *LocalRuntime {
@@ -179,4 +182,138 @@ func TestTransferTask_ConcurrentChildrenAreAttributedAtSource(t *testing.T) {
 		assert.NotZero(t, wrapped)
 		assert.Zero(t, rawToolEvents, "no child tool event reaches the parent stream unattributed")
 	}
+}
+
+// Concurrent transfer_task children share resumeChan and a ResumeRequest
+// names no target, while sub-agent tabs show each child's prompt in its own
+// tab. Prompts must therefore be serialised runtime-wide: the answer given to
+// the one visible prompt applies to that child only.
+func TestTransferTask_ConcurrentChildPromptsAreAnsweredOneAtATime(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	ran := map[string]bool{}
+	record := func(name string) func() {
+		return func() {
+			mu.Lock()
+			defer mu.Unlock()
+			ran[name] = true
+		}
+	}
+	hasRun := func(name string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return ran[name]
+	}
+	a := probeAgent("a", "a done", record("a"))
+	b := probeAgent("b", "b done", record("b"))
+	root := agent.New("root", "Root agent", agent.WithModel(&mockProvider{id: "test/mock-model", stream: &mockStream{}}))
+	agent.WithSubAgents(a, b)(root)
+	rt, err := NewLocalRuntime(t.Context(), team.New(team.WithAgents(root, a, b)),
+		WithSessionCompaction(false), WithModelStore(mockModelStore{}))
+	require.NoError(t, err)
+	rt.EnableSubSessionEvents()
+
+	parent := session.New(session.WithUserMessage("Test"), session.WithAgentName("root"))
+	evts := make(chan Event, 1024)
+	sink := NewChannelSink(evts)
+	var wg sync.WaitGroup
+	for _, target := range []string{"a", "b"} {
+		wg.Go(func() {
+			_, _ = rt.handleTaskTransfer(t.Context(), parent, transferToolCall(target), sink, tools.NopRuntime{})
+		})
+	}
+
+	agentOf := map[string]string{}
+	nextPrompt := func(wait time.Duration) string {
+		deadline := time.After(wait)
+		for {
+			select {
+			case ev := <-evts:
+				switch ev := ev.(type) {
+				case *SubSessionStartedEvent:
+					agentOf[ev.SessionID] = ev.AgentName
+				case *SubSessionStreamEvent:
+					if _, ok := ev.Event.(*ToolCallConfirmationEvent); ok {
+						return ev.SessionID
+					}
+				}
+			case <-deadline:
+				return ""
+			}
+		}
+	}
+
+	first := nextPrompt(5 * time.Second)
+	require.NotEmpty(t, first, "a child must prompt")
+	assert.Empty(t, nextPrompt(300*time.Millisecond), "the second child must wait until the first prompt is answered")
+
+	rt.Resume(t.Context(), ResumeApprove())
+	second := nextPrompt(5 * time.Second)
+	require.NotEmpty(t, second)
+	require.NotEqual(t, first, second)
+	assert.True(t, hasRun(agentOf[first]), "the approval applied to the prompt that was shown")
+	assert.False(t, hasRun(agentOf[second]), "the waiting child's tool must not run on the other child's approval")
+
+	rt.Resume(t.Context(), ResumeReject("no"))
+	go func() {
+		for range evts {
+		}
+	}()
+	wg.Wait()
+	assert.False(t, hasRun(agentOf[second]), "the rejection applied to the second prompt only")
+}
+
+// A child's nested sessions that are not announced delegations (skills, or a
+// grandchild's own tagged events) must reach the UI attributed to the child.
+func TestTransferTask_NestedSessionEventsAreAttributedToTheChild(t *testing.T) {
+	t.Parallel()
+
+	g := agent.New("g", "Grandchild", agent.WithModel(&mockProvider{
+		id: "test/mock-model", stream: newStreamBuilder().AddContent("g done").AddStopWithUsage(1, 1).Build(),
+	}))
+	a := agent.New("a", "Child", agent.WithModel(&queueProvider{id: "test/mock-model", streams: []chat.MessageStream{
+		newStreamBuilder().AddToolCallWithStop("call_g", "transfer_task", `{"agent":"g","task":"nested"}`).Build(),
+		newStreamBuilder().AddContent("a done").AddStopWithUsage(1, 1).Build(),
+	}}), agent.WithToolSets(transfertask.New()))
+	agent.WithSubAgents(g)(a)
+	root := agent.New("root", "Root agent", agent.WithModel(&mockProvider{id: "test/mock-model", stream: &mockStream{}}))
+	agent.WithSubAgents(a)(root)
+	rt, err := NewLocalRuntime(t.Context(), team.New(team.WithAgents(root, a, g)),
+		WithSessionCompaction(false), WithModelStore(mockModelStore{}))
+	require.NoError(t, err)
+	rt.EnableSubSessionEvents()
+
+	parent := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true), session.WithAgentName("root"))
+	evts := make(chan Event, 1024)
+	res, err := rt.handleTaskTransfer(t.Context(), parent, transferToolCall("a"), NewChannelSink(evts), tools.NopRuntime{})
+	require.NoError(t, err)
+	require.Equal(t, "a done", res.Output)
+	close(evts)
+
+	announced := map[string]string{}
+	var nestedWrapped bool
+	for event := range evts {
+		switch ev := event.(type) {
+		case *SubSessionStartedEvent:
+			announced[ev.AgentName] = ev.SessionID
+		case *SubSessionStreamEvent:
+			if inner, ok := ev.Event.(SessionScoped); ok && inner.GetSessionID() != ev.SessionID {
+				nestedWrapped = true
+				assert.Equal(t, announced["a"], ev.SessionID, "a nested session's events are attributed to the child running it")
+			}
+		case SessionScoped:
+			switch id := ev.GetSessionID(); id {
+			case "", parent.ID, announced["a"]:
+			default:
+				switch event.(type) {
+				case *ElicitationRequestEvent, *TokenUsageEvent:
+				default:
+					t.Errorf("%T tagged with nested session %q reached the parent bare", event, id)
+				}
+			}
+		}
+	}
+	require.Contains(t, announced, "g")
+	assert.True(t, nestedWrapped)
 }

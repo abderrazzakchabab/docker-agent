@@ -378,6 +378,9 @@ type LocalRuntime struct {
 	// subSessionEvents opts into SubSessionStarted announcements and
 	// background sub-session stream forwarding; see EnableSubSessionEvents.
 	subSessionEvents atomic.Bool
+	// promptMu serialises user prompts across all sessions once
+	// subSessionEvents is on; see sharedPromptMu.
+	promptMu sync.Mutex
 
 	bgAgents *agenttool.Handler
 
@@ -1634,6 +1637,19 @@ func (r *LocalRuntime) OnBackgroundEvent(handler func(Event)) {
 // sub-sessions see no new events.
 func (r *LocalRuntime) EnableSubSessionEvents() {
 	r.subSessionEvents.Store(true)
+}
+
+// sharedPromptMu returns the runtime-wide prompt mutex when sub-session events
+// are enabled, nil otherwise. Concurrent transfer_task children share
+// resumeChan and ResumeRequest names no target, while sub-agent tabs show
+// each child's prompt in its own tab: holding this mutex from emitting a
+// prompt until its answer arrives keeps at most one prompt outstanding, so an
+// answer always applies to the prompt the user sees.
+func (r *LocalRuntime) sharedPromptMu() *sync.Mutex {
+	if r.subSessionEvents.Load() {
+		return &r.promptMu
+	}
+	return nil
 }
 
 // emitBackgroundEvent forwards an event from detached background work to the

@@ -127,7 +127,6 @@ func TestSubAgentTabRejectsSessionCommands(t *testing.T) {
 	_, _ = m.handleSwitchTab(subAgentTabID)
 	assert.NotNil(t, m.rejectInSubAgentTab(messages.ClearSessionMsg{}))
 	assert.NotNil(t, m.rejectInSubAgentTab(messages.ToggleSessionStarMsg{}))
-	assert.Nil(t, m.rejectInSubAgentTab(messages.ToggleSessionStarMsg{SessionID: "named"}))
 
 	_, _ = m.Update(messages.ClearSessionMsg{})
 	runner := m.supervisor.GetRunner(subAgentTabID)
@@ -183,4 +182,40 @@ func TestInFlightSubAgentPromptAfterCloseReachesParent(t *testing.T) {
 
 func queuedRuntimeDeliveryTo(id string, event tea.Msg) messages.RoutedMsg {
 	return messages.RoutedMsg{SessionID: id, Scope: &messages.RouteScope{}, Inner: event}
+}
+
+// Sub-agent tabs pass an allowlist only: the shared runtime and the store
+// must be unreachable from the read-only view.
+func TestSubAgentTabCommandAllowlist(t *testing.T) {
+	t.Parallel()
+	m, _ := newSubAgentTabModel(t)
+	_, _ = m.handleSwitchTab(subAgentTabID)
+	require.Same(t, m.supervisor.GetRunner(subAgentTabID).App, m.application)
+
+	for _, msg := range []tea.Msg{
+		messages.ChangeModelMsg{ModelRef: "openai/gpt-4o"},
+		messages.SetThinkingLevelMsg{Level: "high"},
+		messages.RestartToolsetMsg{},
+		messages.ToggleHideToolResultsMsg{},
+		messages.ToggleSplitDiffMsg{},
+		messages.OpenModelPickerMsg{},
+		messages.SendMsg{Content: "hi"},
+		messages.ShowCostDialogMsg{},
+		messages.DeleteSessionMsg{SessionID: "named"},
+		&messages.CompactSessionMsg{},
+	} {
+		assert.NotNil(t, m.rejectInSubAgentTab(msg), "%T must be rejected in a sub-agent tab", msg)
+	}
+	for _, msg := range []tea.Msg{
+		messages.SwitchTabMsg{}, messages.CloseTabMsg{}, messages.ReorderTabMsg{},
+		messages.SpawnSessionMsg{}, messages.OpenSessionBrowserMsg{}, messages.LoadSessionMsg{},
+		messages.ElicitationResponseMsg{}, messages.CopyLastResponseToClipboardMsg{},
+		messages.ExitSessionMsg{}, messages.RoutedMsg{}, messages.TabsUpdatedMsg{},
+		messages.SubAgentTabOpenedMsg{}, messages.StreamCancelledMsg{},
+	} {
+		assert.Nil(t, m.rejectInSubAgentTab(msg), "%T must stay available in a sub-agent tab", msg)
+	}
+
+	_, _ = m.handleSwitchTab(m.supervisor.GetRunner(subAgentTabID).ParentID)
+	assert.Nil(t, m.rejectInSubAgentTab(messages.ChangeModelMsg{}), "normal tabs keep every command")
 }

@@ -392,12 +392,20 @@ func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Sessio
 	if req.directNativeTransfer && r.subSessionEvents.Load() {
 		evts.Emit(SubSessionStarted(parent.ID, s.ID, req.AgentName, req.Task, false))
 		forward = func(event Event) {
-			// Tagged events keep their pipeline (persistence filter, mirrored
-			// elicitation dedupe, usage accounting); untagged ones would be
-			// indistinguishable from a concurrent sibling's.
-			if scoped, ok := event.(SessionScoped); ok && scoped.GetSessionID() != "" {
+			// The child's own tagged events, elicitations (the app dedupes
+			// their mirrored copy by type), usage (accounted by the parent)
+			// and nested delegations' own attribution stay bare. Everything
+			// else, untagged or tagged by a nested non-delegation session
+			// such as a skill, is attributed to this child here.
+			switch ev := event.(type) {
+			case *ElicitationRequestEvent, *TokenUsageEvent, *SubSessionStartedEvent, *SubSessionStreamEvent:
 				evts.Emit(event)
 				return
+			case SessionScoped:
+				if ev.GetSessionID() == s.ID {
+					evts.Emit(event)
+					return
+				}
 			}
 			evts.Emit(SubSessionStream(s.ID, req.AgentName, false, event))
 		}

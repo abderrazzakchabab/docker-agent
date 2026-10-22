@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker-agent/pkg/app"
 	"github.com/docker/docker-agent/pkg/runtime"
+	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/tui/messages"
 	"github.com/docker/docker-agent/pkg/tui/service/tabstate"
 )
@@ -25,13 +26,15 @@ type subAgentRoute struct {
 // subAgentRouter attributes one tab subscription's events to sub-agent tabs
 // by session ID only: the runtime tags or wraps (SubSessionStreamEvent) every
 // event of an announced sub-session, so concurrent children never mix.
+// Sessions a child runs without announcing them (skills) are learned from
+// its wrappers, so their bare events (elicitations) follow the child.
 // Used only from the subscription goroutine.
 type subAgentRouter struct {
-	known map[string]bool
+	owner map[string]string // session ID -> sub-agent tab ID
 }
 
 func newSubAgentRouter() *subAgentRouter {
-	return &subAgentRouter{known: make(map[string]bool)}
+	return &subAgentRouter{owner: make(map[string]string)}
 }
 
 func (r *subAgentRouter) route(msg tea.Msg) subAgentRoute {
@@ -39,18 +42,18 @@ func (r *subAgentRouter) route(msg tea.Msg) subAgentRoute {
 	for {
 		switch ev := msg.(type) {
 		case *runtime.SubSessionStartedEvent:
-			if !r.known[ev.SessionID] {
-				r.known[ev.SessionID] = true
+			if r.owner[ev.SessionID] == "" {
+				r.owner[ev.SessionID] = ev.SessionID
 				route.open = append(route.open, ev)
 			}
 			return subAgentRoute{open: route.open}
 		case *runtime.SubSessionStreamEvent:
-			if !r.known[ev.SessionID] {
+			if r.owner[ev.SessionID] == "" {
 				// A subscription started mid-task never saw the announcement.
-				r.known[ev.SessionID] = true
+				r.owner[ev.SessionID] = ev.SessionID
 				route.open = append(route.open, &runtime.SubSessionStartedEvent{SessionID: ev.SessionID, AgentContext: ev.AgentContext, Background: ev.Background})
 			}
-			route.target = ev.SessionID
+			route.target = r.owner[ev.SessionID]
 			msg = ev.Event
 			continue
 		case *runtime.TokenUsageEvent:
@@ -59,10 +62,13 @@ func (r *subAgentRouter) route(msg tea.Msg) subAgentRoute {
 		}
 		break
 	}
-	// Tagged events of non-delegation sessions (skills) stay with the
-	// enclosing sub-agent, or the subscribing tab.
-	if scoped, ok := msg.(runtime.SessionScoped); ok && r.known[scoped.GetSessionID()] {
-		route.target = scoped.GetSessionID()
+	if scoped, ok := msg.(runtime.SessionScoped); ok {
+		switch id := scoped.GetSessionID(); {
+		case r.owner[id] != "":
+			route.target = r.owner[id]
+		case id != "" && route.target != "":
+			r.owner[id] = route.target
+		}
 	}
 	route.msg = msg
 	return route
@@ -101,6 +107,9 @@ func (s *Supervisor) EnableSubAgentTabs() {
 // routeSubAgentMsg delivers one message of parentID's subscription, opening a
 // sub-agent tab first when the runtime announces a new sub-session.
 func (s *Supervisor) routeSubAgentMsg(send func(tea.Msg), router *subAgentRouter, parentID string, scope *messages.RouteScope, msg tea.Msg) {
+	// After send returns the TUI has taken every earlier message, so no prompt
+	// for the finished sub-session is still in flight.
+	defer s.forgetFinishedSubAgent(msg)
 	route := router.route(msg)
 	for _, open := range route.open {
 		if s.AddSubAgentTab(parentID, open) {
@@ -137,6 +146,9 @@ func (s *Supervisor) AddSubAgentTab(parentID string, ev *runtime.SubSessionStart
 
 	parent := s.runners[parentID]
 	if ev.SessionID == "" || s.runners[ev.SessionID] != nil || parent == nil || parent.ParentID != "" {
+		return false
+	}
+	if _, closed := s.closedSubAgents[ev.SessionID]; closed {
 		return false
 	}
 	title := subAgentTabTitle(ev.AgentName, ev.Task)
@@ -183,4 +195,28 @@ func (s *Supervisor) ClosedSubAgentParent(tabID string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.closedSubAgents[tabID]
+}
+
+// forgetFinishedSubAgent drops the closed-tab record of a sub-session that
+// can no longer prompt.
+func (s *Supervisor) forgetFinishedSubAgent(msg tea.Msg) {
+	var id string
+	switch ev := msg.(type) {
+	case *runtime.SubSessionCompletedEvent:
+		if sub, ok := ev.SubSession.(*session.Session); ok {
+			id = sub.ID
+		}
+	case *runtime.SubSessionStreamEvent:
+		// Background sub-sessions announce no completion; their last event is
+		// their own stream stop.
+		if stop, ok := ev.Event.(*runtime.StreamStoppedEvent); ok && ev.Background && stop.SessionID == ev.SessionID {
+			id = ev.SessionID
+		}
+	}
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.closedSubAgents, id)
 }

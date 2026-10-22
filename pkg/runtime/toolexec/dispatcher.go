@@ -227,7 +227,11 @@ type Dispatcher struct {
 	// [tools.ErrRecallNotSupported].
 	Recall func(ctx context.Context, sess *session.Session, a *agent.Agent, message string) error
 
-	confirmationMu         *sync.Mutex
+	// ConfirmationMu serialises confirmation prompts. [ResumeRequest] carries
+	// no tool-call ID, so every waiter on Resume must share it; when nil the
+	// dispatcher uses its own, which only covers its batch.
+	ConfirmationMu *sync.Mutex
+
 	fallbackConfirmationMu sync.Mutex
 }
 
@@ -789,8 +793,8 @@ func denyErrorMessage(d PermissionDecision, toolName string) string {
 }
 
 func (c *call) confirmationMutex() *sync.Mutex {
-	if c.d.confirmationMu != nil {
-		return c.d.confirmationMu
+	if c.d.ConfirmationMu != nil {
+		return c.d.ConfirmationMu
 	}
 	return &c.d.fallbackConfirmationMu
 }

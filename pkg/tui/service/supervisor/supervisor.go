@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -343,6 +344,9 @@ func (s *Supervisor) CloseSession(sessionID string) string {
 			s.closedSubAgents = make(map[string]string)
 		}
 		s.closedSubAgents[sessionID] = runner.ParentID
+	} else {
+		// The parent's runtime, and every sub-session in it, is gone.
+		maps.DeleteFunc(s.closedSubAgents, func(_, parentID string) bool { return parentID == sessionID })
 	}
 
 	// Remove from order slice, remembering where it was.

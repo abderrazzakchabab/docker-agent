@@ -64,10 +64,10 @@ func (g *Gate) ConfirmAndRun(ctx context.Context, run tools.ConfirmedRun, exec f
 		Hooks:          g.Hooks,
 		Resume:         g.Resume,
 		Permissions:    g.Permissions,
-		confirmationMu: g.Mu,
+		ConfirmationMu: g.Mu,
 	}
-	if d.confirmationMu == nil {
-		d.confirmationMu = &sync.Mutex{}
+	if d.ConfirmationMu == nil {
+		d.ConfirmationMu = &sync.Mutex{}
 	}
 	c := &call{
 		d:         d,
