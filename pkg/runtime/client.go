@@ -124,6 +124,11 @@ func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
 			"message_added":          func() Event { return &MessageAddedEvent{} },
 			"model_fallback":         func() Event { return &ModelFallbackEvent{} },
 			"sub_session_completed":  func() Event { return &SubSessionCompletedEvent{} },
+			"sub_session_started":    func() Event { return &SubSessionStartedEvent{} },
+			// Local-only: LocalRuntime emits it only when an embedder opts in;
+			// servers never stream it, and its interface-typed inner event
+			// cannot be decoded from JSON.
+			"sub_session_stream": func() Event { return &SubSessionStreamEvent{} },
 		},
 	}
 

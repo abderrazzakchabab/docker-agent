@@ -63,6 +63,10 @@ type App struct {
 	subsMu          sync.Mutex
 	subs            []*eventSubscriber
 	fanoutOnce      sync.Once
+
+	// subSessionEvents switches the fan-out to the prompt-preserving
+	// overflow policy; see EnableSubSessionEvents.
+	subSessionEvents atomic.Bool
 }
 
 // Opt is an option for creating a new App.
@@ -1240,6 +1244,10 @@ func (a *App) startFanOut() {
 				select {
 				case ch <- msg:
 				default:
+					if a.subSessionEvents.Load() {
+						a.deliverUnderPressure(ch, msg)
+						continue
+					}
 					if !isTurnBoundaryEvent(msg) {
 						slog.Warn("app: subscriber buffer full, dropping event")
 						continue
@@ -1269,7 +1277,14 @@ func (a *App) startFanOut() {
 // usable on overflow. Content deltas are also irrecoverable; TUI consumers
 // must use SubscribeReliable instead.
 func isTurnBoundaryEvent(msg tea.Msg) bool {
-	switch msg.(type) {
+	switch ev := msg.(type) {
+	case *runtime.SubSessionStartedEvent:
+		// Opens the sub-session's view; everything it streams is attributed to it.
+		return true
+	case *runtime.SubSessionStreamEvent:
+		// A wrapped prompt is as irrecoverable as a boundary: the sub-session
+		// blocks on it until answered.
+		return isPrompt(ev) || isTurnBoundaryEvent(runtime.InnermostEvent(ev))
 	case *runtime.StreamStartedEvent,
 		*runtime.StreamStoppedEvent,
 		*runtime.UserMessageEvent,
@@ -1280,6 +1295,103 @@ func isTurnBoundaryEvent(msg tea.Msg) bool {
 	default:
 		return false
 	}
+}
+
+// isPrompt reports whether msg, bare or wrapped, is a prompt the runtime
+// blocks on until the user answers.
+func isPrompt(msg tea.Msg) bool {
+	if ev, ok := msg.(runtime.Event); ok {
+		msg = runtime.InnermostEvent(ev)
+	}
+	switch msg.(type) {
+	case *runtime.ToolCallConfirmationEvent, *runtime.MaxIterationsReachedEvent, *runtime.ElicitationRequestEvent:
+		return true
+	default:
+		return false
+	}
+}
+
+// promptRetryInterval bounds how long a blocked prompt delivery goes without
+// checking that its subscriber is still registered.
+const promptRetryInterval = 50 * time.Millisecond
+
+// deliverUnderPressure is the overflow policy once sub-session events are
+// enabled. Prompts are never dropped or evicted: a sub-session waits on them,
+// so they evict an unprotected pending event or wait for the subscriber.
+// Boundaries evict an unprotected event, else the oldest non-prompt
+// boundary, else are dropped. Everything else is dropped as before.
+func (a *App) deliverUnderPressure(ch chan tea.Msg, msg tea.Msg) {
+	switch {
+	case isPrompt(msg):
+		if evictPending(ch, false) && trySend(ch, msg) {
+			return
+		}
+		for {
+			if a.sendOrRecheck(ch, msg) {
+				return
+			}
+		}
+	case isTurnBoundaryEvent(msg):
+		if !evictPending(ch, true) || !trySend(ch, msg) {
+			slog.Warn("app: subscriber buffer full of prompts, dropping turn-boundary event")
+		}
+	default:
+		slog.Warn("app: subscriber buffer full, dropping event")
+	}
+}
+
+// sendOrRecheck waits up to promptRetryInterval to deliver msg. It reports
+// true once delivered or once the subscriber is gone, so an abandoned
+// channel never wedges the fan-out.
+func (a *App) sendOrRecheck(ch chan tea.Msg, msg tea.Msg) bool {
+	timer := time.NewTimer(promptRetryInterval)
+	defer timer.Stop()
+	select {
+	case ch <- msg:
+		return true
+	case <-timer.C:
+	}
+	a.subsMu.Lock()
+	defer a.subsMu.Unlock()
+	return !slices.ContainsFunc(a.subs, func(sub *eventSubscriber) bool { return sub.ch == ch })
+}
+
+func trySend(ch chan tea.Msg, msg tea.Msg) bool {
+	select {
+	case ch <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+// evictPending frees one slot in ch by removing the oldest pending event that
+// is neither a prompt nor (unless evictBoundaries) a turn boundary, keeping the
+// order of the rest. Only the fan-out sends on ch, so re-queuing always fits.
+func evictPending(ch chan tea.Msg, evictBoundaries bool) bool {
+	var pending []tea.Msg
+	for drained := false; !drained; {
+		select {
+		case msg := <-ch:
+			pending = append(pending, msg)
+		default:
+			drained = true
+		}
+	}
+	victim := slices.IndexFunc(pending, func(msg tea.Msg) bool {
+		return !isPrompt(msg) && !isTurnBoundaryEvent(msg)
+	})
+	if victim < 0 && evictBoundaries {
+		victim = slices.IndexFunc(pending, func(msg tea.Msg) bool { return !isPrompt(msg) })
+	}
+	if victim >= 0 {
+		pending = slices.Delete(pending, victim, victim+1)
+	}
+	for _, msg := range pending {
+		ch <- msg
+	}
+	// The subscriber may have drained ch meanwhile, which frees room too.
+	return victim >= 0 || len(pending) < cap(ch)
 }
 
 // Resume resumes the runtime with the given confirmation request
@@ -2067,7 +2179,7 @@ func (a *App) mergeEvents(events []tea.Msg) []tea.Msg {
 }
 
 // mergeAgentChoiceRun merges first with any directly-following AgentChoiceEvents
-// for the same agent and session. It returns the merged event and the number of follow-up
+// for the same agent and session; concurrent sub-sessions of one agent stay apart. It returns the merged event and the number of follow-up
 // events that were consumed.
 func mergeAgentChoiceRun(first *runtime.AgentChoiceEvent, rest []tea.Msg) (*runtime.AgentChoiceEvent, int) {
 	n := 0

@@ -261,6 +261,9 @@ type appModel struct {
 	// hideSidebar hides the sidebar and disables the ctrl+b toggle.
 	hideSidebar bool
 
+	// subAgentTabs streams each delegated sub-agent session in its own tab.
+	subAgentTabs bool
+
 	// defaultNewSessionDir, when non-empty, is the directory generic
 	// new-session actions (/new, Ctrl+T, the tab-bar and status-bar "+")
 	// spawn in instead of opening the working-directory picker. Set only
@@ -558,6 +561,10 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 
 	// Initialize status bar (pass m as help provider)
 	m.statusBar = statusbar.New(m, statusbar.WithTitle(m.appName+" "+m.appVersion))
+
+	if m.subAgentTabs && !m.leanMode {
+		sv.EnableSubAgentTabs()
+	}
 
 	// Add the initial session to the supervisor
 	sv.AddSession(ctx, initialApp, initialApp.Session(), initialWorkingDir, cleanup)
@@ -911,6 +918,9 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	if cmd := m.rejectInSubAgentTab(msg); cmd != nil {
+		return m, cmd
+	}
 
 	switch msg := msg.(type) {
 	// --- Routing & Animation ---
@@ -973,6 +983,9 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.SwitchTabMsg:
 		return m.handleSwitchTab(msg.SessionID)
 
+	case messages.SubAgentTabOpenedMsg:
+		return m.handleSubAgentTabOpened(msg.TabID)
+
 	case messages.CloseTabMsg:
 		return m.handleCloseTab(msg.SessionID)
 
@@ -984,7 +997,7 @@ func (m *appModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.hideSidebar {
 			return m, nil
 		}
-		if m.tuiStore != nil {
+		if m.tuiStore != nil && !m.isSubAgentTab(m.supervisor.ActiveID()) {
 			persistedID := m.persistedSessionID(m.supervisor.ActiveID())
 			if err := m.tuiStore.ToggleSidebarCollapsed(m.ctx(), persistedID); err != nil {
 				slog.Warn("Failed to persist sidebar collapsed state", "error", err)
@@ -1584,6 +1597,15 @@ func (m *appModel) handleRoutedMsg(msg messages.RoutedMsg) (tea.Model, tea.Cmd) 
 	if runner != nil && !runner.App.IsCurrentOperation(msg.Inner) {
 		return m, nil
 	}
+	if runner == nil && supervisor.IsAttention(msg.Inner) {
+		// The sub-agent tab closed while this prompt was in flight; its
+		// sub-session keeps running and still waits on the answer.
+		if parentID := m.supervisor.ClosedSubAgentParent(msg.SessionID); parentID != "" {
+			if parent := m.supervisor.GetRunner(parentID); parent != nil {
+				return m.handleRoutedMsg(messages.RoutedMsg{SessionID: parentID, Scope: parent.Scope, Inner: msg.Inner})
+			}
+		}
+	}
 	if msg.Scope != nil && (runner == nil || runner.Scope != msg.Scope) {
 		return m, nil
 	}
@@ -2030,7 +2052,9 @@ func (m *appModel) handleSwitchTab(sessionID string) (tea.Model, tea.Cmd) {
 	}
 
 	m.reapplyKeyboardEnhancements()
-	m.persistActiveTab(m.persistedSessionID(sessionID))
+	if runner.ParentID == "" {
+		m.persistActiveTab(m.persistedSessionID(sessionID))
+	}
 
 	// Sync editor working state and reset working spinner.
 	m.activeTab.editor.SetWorking(m.activeTab.chatPage.IsWorking())
@@ -2080,9 +2104,11 @@ func (m *appModel) handleReorderTab(msg messages.ReorderTabMsg) {
 
 	if m.tuiStore != nil {
 		tabs, _ := m.supervisor.GetTabs()
-		ids := make([]string, len(tabs))
-		for i, tab := range tabs {
-			ids[i] = m.persistedSessionID(tab.SessionID)
+		ids := make([]string, 0, len(tabs))
+		for _, tab := range tabs {
+			if !m.isSubAgentTab(tab.SessionID) {
+				ids = append(ids, m.persistedSessionID(tab.SessionID))
+			}
 		}
 		if err := m.tuiStore.ReorderTab(m.ctx(), ids); err != nil {
 			slog.Warn("Failed to persist tab reorder", "error", err)
@@ -2092,6 +2118,13 @@ func (m *appModel) handleReorderTab(msg messages.ReorderTabMsg) {
 
 // handleCloseTab closes a session tab.
 func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
+	// Closing a sub-agent tab only hides the view; its sub-session keeps running.
+	subAgentCmd := m.closeSubAgentTabs(sessionID)
+	var parentID string
+	if runner := m.supervisor.GetRunner(sessionID); runner != nil {
+		parentID = runner.ParentID
+	}
+	subAgentTab := parentID != ""
 	wasActive := sessionID == m.supervisor.ActiveID()
 	if wasActive {
 		m.cancelSidebarPlanEdit()
@@ -2106,6 +2139,9 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	// Compute persisted session-store ID *before* closing (runner goes away).
 	persistedID := m.persistedSessionID(sessionID)
 
+	if subAgentTab {
+		subAgentCmd = tea.Batch(subAgentCmd, m.handOffSubAgentAttention(sessionID, parentID))
+	}
 	if wasActive {
 		m.retireAttention(m.activeTab)
 	}
@@ -2122,9 +2158,9 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	}
 	delete(m.tabs, sessionID)
 
-	var cmds []tea.Cmd
+	cmds := []tea.Cmd{subAgentCmd}
 	// Remove from persistent store using the persisted session-store ID.
-	if m.tuiStore != nil {
+	if m.tuiStore != nil && !subAgentTab {
 		ctx, cancel := context.WithTimeout(m.ctx(), 1*time.Second)
 		defer cancel()
 		if err := m.tuiStore.RemoveTab(ctx, persistedID); err != nil {
@@ -2144,14 +2180,20 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 		if workingDir == "" {
 			workingDir = "."
 		}
-		return m.handleSpawnSession(workingDir)
+		model, cmd := m.handleSpawnSession(workingDir)
+		return model, tea.Batch(subAgentCmd, cmd)
 	}
 
 	// If the closed tab was active, switch to the next one
 	if wasActive && nextActiveID != "" {
-		return m.handleSwitchTab(nextActiveID)
+		model, cmd := m.handleSwitchTab(nextActiveID)
+		return model, tea.Batch(subAgentCmd, cmd)
 	}
 
+	if subAgentTab {
+		// Prompts handed to a visible parent open now rather than on the next event.
+		cmds = append(cmds, m.replayPendingEvent(parentID))
+	}
 	return m, tea.Batch(cmds...)
 }
 

@@ -45,7 +45,7 @@ func withEventHooks(hooks []onEventHook) app.Opt {
 	return func(a *app.App) {
 		//rubocop:disable Lint/ContextConnectivity
 		go a.SubscribeWith(context.Background(), func(msg tea.Msg) {
-			ev, ok := msg.(runtime.Event)
+			ev, ok := hookEvent(msg)
 			if !ok {
 				return
 			}
@@ -118,4 +118,23 @@ func (b *boundedWriter) Write(p []byte) (int, error) {
 
 func (b *boundedWriter) String() string {
 	return b.buf.String()
+}
+
+// hookEvent returns the runtime event a hook sees for msg. It keeps hooks
+// independent of --sub-agent-tabs: transfer_task events were always seen
+// bare, background sub-session streams never.
+func hookEvent(msg tea.Msg) (runtime.Event, bool) {
+	switch ev := msg.(type) {
+	case *runtime.SubSessionStartedEvent:
+		return nil, false
+	case *runtime.SubSessionStreamEvent:
+		if ev.Background {
+			return nil, false
+		}
+		return runtime.InnermostEvent(ev), true
+	case runtime.Event:
+		return ev, true
+	default:
+		return nil, false
+	}
 }

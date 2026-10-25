@@ -31,6 +31,12 @@ type CloseTabMsg struct {
 	SessionID string // The session to close
 }
 
+// SubAgentTabOpenedMsg is sent when the supervisor added a background tab
+// viewing a delegated sub-agent session. It precedes the tab's first routed event.
+type SubAgentTabOpenedMsg struct {
+	TabID string
+}
+
 // ReorderTabMsg requests moving a tab from one position to another.
 type ReorderTabMsg struct {
 	FromIdx int

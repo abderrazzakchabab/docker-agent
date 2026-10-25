@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -24,8 +25,11 @@ type SessionRunner struct {
 	WorkingDir string
 	State      *tabstate.State
 	Scope      *messages.RouteScope
-	cancel     context.CancelFunc
-	cleanup    func()
+	// ParentID is set on sub-agent tabs: read-only views of a sub-session
+	// running in the parent tab's runtime. They own no context or cleanup.
+	ParentID string
+	cancel   context.CancelFunc
+	cleanup  func()
 }
 
 // SessionSpawner is a function that creates new sessions.
@@ -40,6 +44,11 @@ type Supervisor struct {
 	activeID string
 	spawner  SessionSpawner
 	program  *tea.Program
+	// subAgentTabs opens a tab per delegated sub-session; see EnableSubAgentTabs.
+	subAgentTabs bool
+	// closedSubAgents maps closed sub-agent tabs to their parent tab, so
+	// prompts already in flight to a closed tab can still be redirected.
+	closedSubAgents map[string]string
 
 	// programReady is closed when SetProgram is called. Subscription goroutines
 	// wait on this before terminal delivery; registration happens before startup.
@@ -92,6 +101,9 @@ func (s *Supervisor) AddSession(ctx context.Context, a *app.App, sess *session.S
 
 	// Start the subscription goroutine with routing
 	if a != nil {
+		if s.subAgentTabs {
+			a.EnableSubSessionEvents()
+		}
 		ready := make(chan struct{})
 		go s.subscribeWithRouting(sessionCtx, a, sess.ID, ready)
 		<-ready
@@ -119,6 +131,7 @@ func (s *Supervisor) SpawnSession(ctx context.Context, workingDir string) (strin
 // subscribeWithRouting subscribes to app events and wraps them with session ID.
 // Registration precedes startup; terminal delivery waits for the program.
 func (s *Supervisor) subscribeWithRouting(ctx context.Context, a *app.App, sessionID string, ready chan struct{}) {
+	router := newSubAgentRouter()
 	prepare := func(msg tea.Msg, generation uint64) tea.Msg {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -135,11 +148,22 @@ func (s *Supervisor) subscribeWithRouting(ctx context.Context, a *app.App, sessi
 			return
 		}
 		s.mu.RLock()
-		p := s.program
+		p, subAgentTabs := s.program, s.subAgentTabs
 		s.mu.RUnlock()
-		if p != nil && ctx.Err() == nil {
-			p.Send(msg)
+		if p == nil || ctx.Err() != nil {
+			return
 		}
+		if routed, ok := msg.(messages.RoutedMsg); ok && subAgentTabs {
+			s.routeSubAgentMsg(func(out tea.Msg) {
+				if r, ok := out.(messages.RoutedMsg); ok {
+					r.Valid = routed.Valid
+					out = r
+				}
+				p.Send(out)
+			}, router, sessionID, routed.Scope, routed.Inner)
+			return
+		}
+		p.Send(msg)
 	}
 
 	a.SubscribeReliable(ctx, send, app.WithGenerationEventMapper(prepare), app.WithSubscriptionReady(func() { close(ready) }))
@@ -277,6 +301,9 @@ func (s *Supervisor) ReplaceRunnerApp(ctx context.Context, sessionID string, new
 	// Create a new cancellable context for the replacement.
 	sessionCtx, cancel := context.WithCancel(ctx)
 	runner.cancel = cancel
+	if s.subAgentTabs {
+		newApp.EnableSubSessionEvents()
+	}
 	s.notifyTabsUpdated()
 	s.mu.Unlock()
 
@@ -323,6 +350,15 @@ func (s *Supervisor) CloseSession(sessionID string) string {
 
 	// Remove from maps
 	delete(s.runners, sessionID)
+	if runner.ParentID != "" {
+		if s.closedSubAgents == nil {
+			s.closedSubAgents = make(map[string]string)
+		}
+		s.closedSubAgents[sessionID] = runner.ParentID
+	} else {
+		// The parent's runtime, and every sub-session in it, is gone.
+		maps.DeleteFunc(s.closedSubAgents, func(_, parentID string) bool { return parentID == sessionID })
+	}
 
 	// Remove from order slice, remembering where it was.
 	closedIdx := 0

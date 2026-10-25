@@ -383,6 +383,13 @@ type LocalRuntime struct {
 	onBackgroundEvent   func(Event)
 	onBackgroundContext func(context.Context, Event)
 
+	// subSessionEvents opts into SubSessionStarted announcements and
+	// background sub-session stream forwarding; see EnableSubSessionEvents.
+	subSessionEvents atomic.Bool
+	// promptMu serialises user prompts across all sessions once
+	// subSessionEvents is on; see sharedPromptMu.
+	promptMu sync.Mutex
+
 	bgAgents *agenttool.Handler
 
 	// dmrModelLister lists the models pulled locally in Docker Model Runner,
@@ -1671,6 +1678,29 @@ func (r *LocalRuntime) OnBackgroundEventWithContext(handler func(context.Context
 	defer r.backgroundEventMu.Unlock()
 	r.onBackgroundContext = handler
 	r.onBackgroundEvent = nil
+}
+
+// EnableSubSessionEvents makes the runtime announce delegated sub-sessions
+// (transfer_task, run_background_agent) with a SubSessionStartedEvent and
+// attribute their events with SubSessionStreamEvent: untagged transfer_task
+// events on the parent's stream, and every background event through the
+// OnBackgroundEvent handler. Off by default so embedders that don't render
+// sub-sessions see no new events.
+func (r *LocalRuntime) EnableSubSessionEvents() {
+	r.subSessionEvents.Store(true)
+}
+
+// sharedPromptMu returns the runtime-wide prompt mutex when sub-session events
+// are enabled, nil otherwise. Concurrent transfer_task children share
+// resumeChan and ResumeRequest names no target, while sub-agent tabs show
+// each child's prompt in its own tab: holding this mutex from emitting a
+// prompt until its answer arrives keeps at most one prompt outstanding, so an
+// answer always applies to the prompt the user sees.
+func (r *LocalRuntime) sharedPromptMu() *sync.Mutex {
+	if r.subSessionEvents.Load() {
+		return &r.promptMu
+	}
+	return nil
 }
 
 // emitBackgroundEvent forwards an event from detached background work to the

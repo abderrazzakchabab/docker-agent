@@ -394,10 +394,33 @@ func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Sessio
 	if req.directNativeTransfer {
 		idleRetryPolicy = idleStreamRetryPolicy{enabled: true, parentSessionID: parent.ID}
 	}
+	forward := evts.Emit
+	// directNativeTransfer marks transfer_task; skills keep rendering inline.
+	if req.directNativeTransfer && r.subSessionEvents.Load() {
+		evts.Emit(SubSessionStarted(parent.ID, s.ID, req.AgentName, req.Task, false))
+		forward = func(event Event) {
+			// The child's own tagged events, elicitations (the app dedupes
+			// their mirrored copy by type), usage (accounted by the parent)
+			// and nested delegations' own attribution stay bare. Everything
+			// else, untagged or tagged by a nested non-delegation session
+			// such as a skill, is attributed to this child here.
+			switch ev := event.(type) {
+			case *ElicitationRequestEvent, *TokenUsageEvent, *SubSessionStartedEvent, *SubSessionStreamEvent:
+				evts.Emit(event)
+				return
+			case SessionScoped:
+				if ev.GetSessionID() == s.ID {
+					evts.Emit(event)
+					return
+				}
+			}
+			evts.Emit(SubSessionStream(s.ID, req.AgentName, false, event))
+		}
+	}
 	childEvents := r.runStream(ctx, s, idleRetryPolicy)
 	var subSessionErr error
 	for event := range childEvents {
-		evts.Emit(event)
+		forward(event)
 		if budgetEvent, ok := event.(*BudgetExceededEvent); ok &&
 			req.directNativeTransfer && budgetEvent.SessionID == s.ID && subSessionErr == nil {
 			subSessionErr = errors.New(budgetEvent.Message)
@@ -469,10 +492,26 @@ func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Sessio
 		r.executeSubagentStopHooks(ctx, parent, s, callerAgent, cfg.AgentName, s.GetLastAssistantMessageContent())
 	}()
 
+	// Elicitations already reach the UI through the OnElicitationRequest sink
+	// and usage is surfaced unwrapped by forwardBackgroundUsage; forwarding
+	// either again would duplicate them.
+	forward := func(Event) {}
+	if r.subSessionEvents.Load() {
+		r.emitBackgroundEvent(ctx, SubSessionStarted(parent.ID, s.ID, cfg.AgentName, cfg.Task, true))
+		forward = func(event Event) {
+			switch event.(type) {
+			case *ElicitationRequestEvent, *TokenUsageEvent, *EvaluationUsageEvent:
+				return
+			}
+			r.emitBackgroundEvent(ctx, SubSessionStream(s.ID, cfg.AgentName, true, event))
+		}
+	}
+
 	var errMsg string
 	events := r.RunStream(ctx, s)
 	for event := range events {
 		r.forwardBackgroundUsage(ctx, event)
+		forward(event)
 		if ctx.Err() != nil {
 			break
 		}
@@ -499,6 +538,7 @@ func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Sessio
 	// close the channel without blocking on a full buffer.
 	for event := range events {
 		r.forwardBackgroundUsage(ctx, event)
+		forward(event)
 	}
 
 	// Emit one authoritative final snapshot before the child
