@@ -13,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 
 	"github.com/docker/docker-agent/pkg/app"
 	"github.com/docker/docker-agent/pkg/chat"
@@ -250,7 +251,6 @@ type chatPage struct {
 	// Track whether we've received content from an assistant response
 	// Used by --exit-after-response to ensure we don't exit before receiving content
 	hasReceivedAssistantContent bool
-	showStartupBanner           bool
 	// hideBanner mirrors the user's show_banner setting; the zero value
 	// keeps the banner so page literals stay banner-enabled.
 	hideBanner bool
@@ -402,18 +402,17 @@ func New(ar *animation.Runtime, ctx context.Context, a *app.App, sessionState *s
 	pageCtx, cancel := context.WithCancel(ctx)
 	registry := tooldefaults.NewRegistry()
 	p := &chatPage{
-		toolRenderers:     registry,
-		ar:                ar,
-		cancel:            cancel,
-		ctx:               func() context.Context { return context.WithoutCancel(ctx) },
-		inputScope:        newInputScope(context.WithoutCancel(ctx), a),
-		sidebar:           sidebar.New(ar, pageCtx, sessionState),
-		messages:          messages.New(ar, sessionState, messages.WithToolRenderers(registry)),
-		app:               a,
-		keyMap:            defaultKeyMap(),
-		commandParser:     commands.NewParser(),
-		sessionState:      sessionState,
-		showStartupBanner: true,
+		toolRenderers: registry,
+		ar:            ar,
+		cancel:        cancel,
+		ctx:           func() context.Context { return context.WithoutCancel(ctx) },
+		inputScope:    newInputScope(context.WithoutCancel(ctx), a),
+		sidebar:       sidebar.New(ar, pageCtx, sessionState),
+		messages:      messages.New(ar, sessionState, messages.WithToolRenderers(registry)),
+		app:           a,
+		keyMap:        defaultKeyMap(),
+		commandParser: commands.NewParser(),
+		sessionState:  sessionState,
 	}
 
 	for _, opt := range opts {
@@ -839,23 +838,58 @@ func (p *chatPage) renderCollapsedSidebar(sl sidebarLayout) string {
 		Render(sidebarWithDivider)
 }
 
+// Startup banner offset from the top-left corner of the chat pane.
+const (
+	bannerTopPadding  = 1
+	bannerLeftPadding = 2
+)
+
+// messagesView renders the messages over a faint banner watermark that stays
+// in the background of the chat pane for the whole session.
 func (p *chatPage) messagesView(sl sidebarLayout) string {
 	messagesView := p.messages.View()
-	if messagesView != "" || !p.showStartupBanner || p.hideBanner {
+	if p.hideBanner || sl.chatWidth < tuibanner.Width+bannerLeftPadding || sl.chatHeight < tuibanner.Height+bannerTopPadding {
 		return messagesView
 	}
-	if sl.chatWidth < tuibanner.Width || sl.chatHeight < tuibanner.Height {
-		return ""
-	}
 
-	banner := styles.BaseStyle.Foreground(styles.Accent).Render(strings.Join(tuibanner.Lines, "\n"))
-	return lipgloss.Place(
-		sl.chatWidth,
-		sl.chatHeight,
-		lipgloss.Center,
-		lipgloss.Center,
-		banner,
-	)
+	banner := styles.FadingStyle.
+		Padding(bannerTopPadding, 0, 0, bannerLeftPadding).
+		Render(strings.Join(tuibanner.Lines, "\n"))
+	return overlayOnBackground(banner, messagesView, sl.chatWidth, sl.chatHeight)
+}
+
+// overlayOnBackground draws fg over bg in a width x height area. On each row,
+// fg is opaque from its first to its last visible cell (plus a one-cell
+// margin); outside that span bg shows through.
+func overlayOnBackground(bg, fg string, width, height int) string {
+	scr := uv.NewScreenBuffer(width, height)
+	uv.NewStyledString(bg).Draw(scr, scr.Bounds())
+
+	top := uv.NewScreenBuffer(width, height)
+	uv.NewStyledString(fg).Draw(top, top.Bounds())
+
+	for y := range height {
+		first, last := -1, -1
+		for x := range width {
+			if c := top.CellAt(x, y); c != nil && (c.Content != " " || c.Style.Bg != nil) {
+				if first < 0 {
+					first = x
+				}
+				last = x
+			}
+		}
+		if first < 0 {
+			continue
+		}
+		for x := max(first-1, 0); x <= min(last+1, width-1); x++ {
+			// Skip wide-character continuation cells; SetCell on the lead
+			// cell already covers them.
+			if c := top.CellAt(x, y); c == nil || c.Width > 0 {
+				scr.SetCell(x, y, c)
+			}
+		}
+	}
+	return scr.Render()
 }
 
 // View renders the chat page (messages + sidebar only, no editor or resize handle)

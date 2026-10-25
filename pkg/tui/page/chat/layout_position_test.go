@@ -24,12 +24,11 @@ func newLayoutTestPage(t *testing.T, position msgtypes.SidebarPosition) *chatPag
 	t.Helper()
 	sessionState := &service.SessionState{}
 	p := &chatPage{
-		sidebar:           sidebar.New(animation.NewRuntime(), t.Context(), sessionState),
-		messages:          messages.New(animation.NewRuntime(), sessionState),
-		sessionState:      sessionState,
-		width:             160,
-		height:            40,
-		showStartupBanner: true,
+		sidebar:      sidebar.New(animation.NewRuntime(), t.Context(), sessionState),
+		messages:     messages.New(animation.NewRuntime(), sessionState),
+		sessionState: sessionState,
+		width:        160,
+		height:       40,
 	}
 	p.layoutSettings = msgtypes.LayoutSettings{SidebarPosition: position}
 	return p
@@ -42,15 +41,13 @@ func TestNewChatPageShowsBannerBeforeAgentInfo(t *testing.T) {
 	p := New(animation.NewRuntime(), t.Context(), nil, sessionState).(*chatPage)
 	p.SetSize(160, 40)
 
-	assert.True(t, p.showStartupBanner)
 	assert.Contains(t, ansi.Strip(p.messagesView(p.computeSidebarLayout())), tuibanner.Lines[0])
 }
 
-func TestStartupBannerIsCenteredInEmptyChat(t *testing.T) {
+func TestStartupBannerIsTopLeftInEmptyChat(t *testing.T) {
 	t.Parallel()
 
 	p := newLayoutTestPage(t, msgtypes.SidebarRight)
-	p.showStartupBanner = true
 	p.SetSize(p.width, p.height)
 	sl := p.computeSidebarLayout()
 
@@ -65,9 +62,8 @@ func TestStartupBannerIsCenteredInEmptyChat(t *testing.T) {
 		}
 	}
 	require.NotEqual(t, -1, firstBannerLine)
-	assert.Equal(t, (sl.chatHeight-len(tuibanner.Lines))/2, firstBannerLine)
-	assert.Equal(t, (sl.chatWidth-ansi.StringWidth(tuibanner.Lines[0]))/2,
-		strings.Index(ansi.Strip(lines[firstBannerLine]), "█"))
+	assert.Equal(t, bannerTopPadding, firstBannerLine)
+	assert.True(t, strings.HasPrefix(ansi.Strip(lines[firstBannerLine]), strings.Repeat(" ", bannerLeftPadding)+tuibanner.Lines[0]))
 }
 
 func TestStartupBannerHiddenWhenChatIsTooSmall(t *testing.T) {
@@ -78,14 +74,13 @@ func TestStartupBannerHiddenWhenChatIsTooSmall(t *testing.T) {
 		width  int
 		height int
 	}{
-		{name: "too narrow", width: tuibanner.Width - 1, height: tuibanner.Height},
-		{name: "too short", width: tuibanner.Width, height: tuibanner.Height - 1},
+		{name: "too narrow", width: tuibanner.Width + bannerLeftPadding - 1, height: tuibanner.Height + bannerTopPadding},
+		{name: "too short", width: tuibanner.Width + bannerLeftPadding, height: tuibanner.Height + bannerTopPadding - 1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := newLayoutTestPage(t, msgtypes.SidebarRight)
-			p.showStartupBanner = true
 
 			assert.Empty(t, p.messagesView(sidebarLayout{
 				chatWidth:  tt.width,
@@ -99,7 +94,6 @@ func TestStartupBannerHiddenWhenDisabled(t *testing.T) {
 	t.Parallel()
 
 	p := newLayoutTestPage(t, msgtypes.SidebarRight)
-	p.showStartupBanner = true
 	p.SetShowBanner(false)
 	p.SetSize(p.width, p.height)
 
@@ -109,61 +103,26 @@ func TestStartupBannerHiddenWhenDisabled(t *testing.T) {
 	assert.Contains(t, ansi.Strip(p.messagesView(p.computeSidebarLayout())), tuibanner.Lines[0])
 }
 
-func TestEmptyAgentInfoDoesNotReactivateStartupBanner(t *testing.T) {
+func TestStartupBannerStaysBehindMessages(t *testing.T) {
 	t.Parallel()
 
 	p := newLayoutTestPage(t, msgtypes.SidebarRight)
-	p.showStartupBanner = false
-	handled, _ := p.handleRuntimeEvent(runtime.AgentInfo("root", "model", "", ""))
-
+	handled, _ := p.handleRuntimeEvent(runtime.AgentInfo("root", "model", "", "Welcome to the agent"))
 	require.True(t, handled)
-	assert.False(t, p.showStartupBanner)
+
+	out := ansi.Strip(p.messagesView(p.computeSidebarLayout()))
+	assert.Contains(t, out, "Welcome to the agent")
+	assert.Contains(t, out, strings.TrimSpace(tuibanner.Lines[len(tuibanner.Lines)-1]))
 }
 
-func TestAgentWelcomeMessageControlsStartupBanner(t *testing.T) {
+func TestOverlayOnBackgroundKeepsForegroundText(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name           string
-		welcomeMessage string
-		wantBanner     bool
-	}{
-		{name: "empty welcome", wantBanner: true},
-		{name: "configured welcome", welcomeMessage: "Welcome to the agent"},
-	}
+	out := overlayOnBackground("xxxxxxx\nxxxxxxx", "a b\n    c", 7, 2)
+	assert.Equal(t, []string{"a b xxx", "xxx c x"}, strings.Split(ansi.Strip(out), "\n"))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := newLayoutTestPage(t, msgtypes.SidebarRight)
-			event := runtime.AgentInfo("root", "model", "", tt.welcomeMessage)
-			handled, _ := p.handleRuntimeEvent(event)
-
-			require.True(t, handled)
-			assert.Equal(t, tt.wantBanner, p.showStartupBanner)
-			out := ansi.Strip(p.messagesView(p.computeSidebarLayout()))
-			if tt.wantBanner {
-				assert.Contains(t, out, tuibanner.Lines[0])
-			} else {
-				assert.Contains(t, out, tt.welcomeMessage)
-				assert.NotContains(t, out, tuibanner.Lines[0])
-			}
-		})
-	}
-}
-
-func TestComputeSidebarLayout_RightDefault(t *testing.T) {
-	t.Parallel()
-
-	p := newLayoutTestPage(t, msgtypes.SidebarRight)
-	sl := p.computeSidebarLayout()
-
-	require.Equal(t, sidebarVertical, sl.mode)
-	assert.False(t, sl.sidebarOnLeft)
-	assert.Equal(t, 0, sl.chatStartX, "chat starts at the left edge")
-	assert.Equal(t, sl.chatWidth, sl.handleX, "handle sits right after the chat")
-	assert.Equal(t, sl.chatWidth+toggleColumnWidth, sl.sidebarStartX)
-	assert.True(t, sl.isInSidebar(sl.sidebarStartX+1))
-	assert.False(t, sl.isInSidebar(2))
+	out = overlayOnBackground("xxxxxxxxxx", "a λ界 t", 10, 1)
+	assert.Equal(t, "a λ界 t xx", ansi.Strip(out))
 }
 
 func TestComputeSidebarLayout_ZeroValueDefaultsToRight(t *testing.T) {

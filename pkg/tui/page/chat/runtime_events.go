@@ -101,7 +101,6 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 
 	// ===== Content Events =====
 	case *runtime.UserMessageEvent:
-		p.showStartupBanner = false
 		p.consumePendingMessage(msg.Message)
 		return true, p.messages.ReplaceLoadingWithUser(msg.Message, msg.SessionPosition)
 
@@ -146,9 +145,6 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 
 	case *runtime.AgentInfoEvent:
 		sidebarCmd := p.sidebar.SetAgentInfo(msg.AgentName, msg.Model, msg.Description, msg.ContextLimit, msg.CompactionModel, msg.PrimaryContextLimit)
-		if msg.WelcomeMessage != "" {
-			p.showStartupBanner = false
-		}
 		p.messages.AddWelcomeMessage(msg.WelcomeMessage)
 		return true, sidebarCmd
 
