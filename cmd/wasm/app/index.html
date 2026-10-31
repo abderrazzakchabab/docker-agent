@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docker-agent</title>
+<meta name="description" content="docker-agent running entirely in your browser (WebAssembly).">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316a34a'/%3E%3Cpath d='M8 20h16M10 15h12M13 10h6' stroke='white' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+<script>
+  try {
+    const t = localStorage.getItem("docker-agent-app:theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch {}
+</script>
+<link rel="stylesheet" href="style.css">
+<script src="wasm_exec.js"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <h1>docker-agent</h1>
+    <span class="tagline">runs in your browser</span>
+  </div>
+  <div class="top-actions">
+    <span id="usage" class="badge" title="Tokens and cost for this session" hidden></span>
+    <span id="runtime-status" class="badge" role="status">Loading runtime…</span>
+    <button id="theme-toggle" type="button" class="ghost" title="Switch theme">Theme: auto</button>
+  </div>
+</header>
+
+<div id="load-banner" class="load-banner">
+  <div class="load-text"><span id="load-label">Loading runtime…</span><span id="load-detail"></span></div>
+  <progress id="load-progress" max="100"></progress>
+</div>
+
+<main class="layout">
+  <aside class="side">
+    <section class="panel" id="config-panel">
+      <div class="panel-head">
+        <h2>Config</h2>
+        <div class="row">
+          <select id="example-picker" aria-label="Load an example config"></select>
+        </div>
+      </div>
+      <textarea id="yaml" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Agent YAML config"></textarea>
+      <p class="hint">Tab inserts two spaces; press Esc then Tab to move focus.</p>
+      <div class="row wrap">
+        <button id="validate" type="button">Validate</button>
+        <label class="inline">Agent
+          <select id="agent-picker" aria-label="Agent to talk to"><option value="">(default)</option></select>
+        </label>
+      </div>
+      <p id="validation" class="status-line" role="status"></p>
+    </section>
+
+    <section class="panel" id="settings-panel">
+      <div class="panel-head"><h2>Keys &amp; settings</h2></div>
+
+      <div class="field">
+        <div class="field-label">OpenRouter</div>
+        <div class="row wrap">
+          <button id="or-signin" type="button">Sign in with OpenRouter</button>
+          <button id="or-signout" type="button" class="ghost" hidden>Sign out</button>
+          <span id="or-status" class="muted"></span>
+        </div>
+        <p class="hint">The key is sent as <code>OPENROUTER_API_KEY</code>.</p>
+      </div>
+
+      <div class="field">
+        <div class="field-label">Environment variables</div>
+        <div id="env-rows" class="env-rows"></div>
+        <button id="env-add" type="button" class="ghost">Add variable</button>
+        <datalist id="env-names">
+          <option value="ANTHROPIC_API_KEY"></option>
+          <option value="OPENAI_API_KEY"></option>
+          <option value="GOOGLE_API_KEY"></option>
+          <option value="GITHUB_TOKEN"></option>
+          <option value="OPENROUTER_API_KEY"></option>
+        </datalist>
+        <label class="check"><input id="remember" type="checkbox"> Remember keys in this browser (localStorage)</label>
+        <p class="hint" id="remember-hint"></p>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="tool-proxy">Tool proxy URL</label>
+        <input id="tool-proxy" type="url" placeholder="https://proxy.example.com/fetch" autocomplete="off" spellcheck="false">
+        <p class="hint">HTTPS egress proxy for remote MCP, <code>fetch</code>, <code>api</code> and <code>openapi</code> tools.</p>
+      </div>
+
+      <div class="field">
+        <label class="check"><input id="auto-approve" type="checkbox"> Auto-approve tool calls</label>
+        <p class="hint">Runs tools without asking, like <code>--yolo</code>.</p>
+      </div>
+
+      <div class="field">
+        <div class="field-label">Documents for <code>type: rag</code></div>
+        <input id="docs-input" type="file" multiple>
+        <ul id="docs-list" class="docs-list"></ul>
+        <p class="hint">Kept in memory only; keyed by file name.</p>
+      </div>
+    </section>
+  </aside>
+
+  <section class="panel chat" id="chat-panel">
+    <div class="panel-head">
+      <h2>Chat</h2>
+      <div class="row wrap">
+        <span id="session-status" class="badge" role="status">No session</span>
+        <button id="start-session" type="button" class="ghost">Start session</button>
+        <button id="new-convo" type="button" class="ghost">New conversation</button>
+      </div>
+    </div>
+    <div id="log" class="log" aria-live="polite">
+      <p class="empty" id="empty-note">Configure an agent, add a key, and say hello.</p>
+    </div>
+    <form id="composer" class="composer">
+      <textarea id="prompt" rows="2" placeholder="Message the agent (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
+      <div class="composer-actions">
+        <button id="stop" type="button" class="danger" disabled>Stop</button>
+        <button id="send" type="submit" class="primary" disabled>Send</button>
+      </div>
+    </form>
+  </section>
+</main>
+</body>
+</html>

@@ -150,6 +150,17 @@ tasks:
     cmds:
       - node cmd/wasm/browser/smoke_test.js --build {{.CLI_ARGS}}
 
+  build-wasm-app:
+    desc: Build the standalone static web app for the wasm build into dist/wasm-app
+    cmds:
+      - bash cmd/wasm/app/build.sh
+
+  serve-wasm-app:
+    desc: Build and serve the wasm web app on http://localhost:8765
+    deps: [build-wasm-app]
+    cmds:
+      - python3 -m http.server 8765 --directory dist/wasm-app
+
   test-binary:
     desc: Run tests on build binary
     deps: [deploy-local]

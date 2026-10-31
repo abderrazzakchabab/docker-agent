@@ -164,6 +164,64 @@ Anthropic / Gemini keys directly. Anthropic recently added
 tab; OpenAI and Gemini still block CORS for browser origins, so those
 fields are mostly there for use against a self-hosted proxy.
 
+## Bundled web app
+
+`app/` is a standalone chat UI over the session API: no CDN, no bundler, no
+server code, so any static host can serve it.
+
+```sh
+task build-wasm-app          # or: bash cmd/wasm/app/build.sh
+task serve-wasm-app          # http://localhost:8765
+```
+
+`build.sh` writes `dist/wasm-app/` (override with `OUT_DIR`; `WASM_TAGS`
+adds build tags such as `docker_agent_wasm_cloud`; `BROTLI=1` adds a `.br`).
+Copy that directory to GitHub Pages, Netlify, Cloudflare Pages, S3 or
+`python3 -m http.server`. It holds the page
+(`index.html`, `style.css`, ES modules), `wasm_exec.js` from the building
+toolchain, `auth.js`, `examples/`, a `_headers` file (Netlify / Cloudflare
+Pages format) and the binary, plain and gzipped.
+
+**Compression.** The loader fetches `docker-agent.wasm.gz` and inflates it
+with `DecompressionStream`, so it works on hosts that do no content
+negotiation. If that fails it falls back to `docker-agent.wasm` through
+`instantiateStreaming` (forcing the `application/wasm` MIME type). A host
+that negotiates can instead serve `docker-agent.wasm.br` as
+`Content-Encoding: br` for `docker-agent.wasm` requests (nginx
+`brotli_static`, Caddy `precompressed`); the `.br` file is only written with
+`BROTLI=1` and the `brotli` CLI installed (`BROTLI_QUALITY`, default 11, takes
+minutes). `build.json` carries a hash of the binary, which the loader appends
+as `?v=` so the wasm files can be cached as immutable.
+Check your host's per-file limit: Cloudflare Pages caps files at 25 MiB,
+which fits the `.gz`/`.br` copies but not the plain binary, so delete the
+plain `.wasm` there and rely on the compressed path (the fallback is then
+unavailable).
+
+**Panels.**
+
+- *Config*: YAML editor (Tab inserts two spaces), bundled examples, a
+  **Validate** button backed by `parseConfig`, and an agent picker filled from
+  `listAgents`.
+- *Keys & settings*: OpenRouter sign-in (`auth.js`, sent as
+  `OPENROUTER_API_KEY`), extra environment variables with masked values, the
+  `toolProxy` URL, the `autoApprove` switch and a document picker for
+  `type: rag` configs.
+- *Chat*: streaming replies, collapsible reasoning, tool cards with live
+  output, inline approval buttons (approve, always approve this tool, reject),
+  elicitation forms, handoff / fallback / warning notices and a token and
+  cost badge. Editing the config or settings marks the session stale; the next
+  send closes it and starts a new one.
+
+**Key storage.** By default keys live in memory and `sessionStorage`, so they
+vanish with the tab. Ticking *Remember keys in this browser* moves them to
+`localStorage`, unencrypted and readable by any script on the origin, so only
+host the app on an origin you control. The config draft, tool proxy URL and
+theme are always kept in `localStorage`; documents are never persisted. Model
+and tool output is rendered with DOM nodes (`textContent`), never `innerHTML`.
+
+`node --test cmd/wasm/app/loader_test.mjs` boots the built `.wasm.gz` and
+`loader.js` (both the gzip path and the plain fallback) under Node.
+
 ## JavaScript API
 
 Once the wasm boots, `globalThis.dockerAgent` offers:
@@ -380,6 +438,7 @@ documents is rejected when the session is created.
 | `bridge.go` | JS ⇄ Go value helpers, promises, awaiting JS callbacks. |
 | `providers.go` | Explicit demo provider registry (OpenAI / Anthropic / Google). |
 | `examples/` | Configs that run unchanged in the browser and in the CLI. |
+| `app/` | Standalone static web app (chat UI, config editor, key entry), `build.sh` and the loader test. |
 | `node/` | Node loader and JS bridge tests. |
 | `browser/` | Headless Chrome integration tests using real fetch and local mock services. |
 
